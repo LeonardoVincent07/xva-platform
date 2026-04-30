@@ -6,7 +6,7 @@ from backend.app.modules.trades.models import Base
 from backend.app.modules.trades.routes import router as mvp_router
 from backend.app.modules.screens.routes import router as screens_router
 
-Base.metadata.drop_all(bind=engine)
+# Base.metadata.drop_all(bind=engine)
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="XVA Platform MVP")

@@ -51,6 +51,7 @@ function App() {
       currency: form.currency,
       maturity: form.maturity,
       direction: form.direction,
+      floating_index: form.floating_index,
       notional: Number(form.notional),
       fixed_rate: Number(form.fixed_rate) / 100,
       maturity_override: null
@@ -141,8 +142,50 @@ function App() {
           <div>CVA: £{Number(result.cva_amount).toLocaleString()}</div>
           <div>CS01: {result.cs01}</div>
           <div>Run ID: {result.calculation_run_id}</div>
+          <ExposureChart data={result.exposure_profile || []} />
         </div>
       )}
+    </div>
+  )
+}
+
+function ExposureChart({ data }) {
+  if (!data.length) return null
+
+  const width = 560
+  const height = 220
+  const padding = 32
+  const values = data.map(point => Number(point.expected_positive_exposure ?? point.epe ?? 0))
+  const maxValue = Math.max(...values, 1)
+
+  const points = values.map((value, index) => {
+    const x = padding + (index * (width - padding * 2)) / Math.max(values.length - 1, 1)
+    const y = height - padding - (value / maxValue) * (height - padding * 2)
+    return `${x},${y}`
+  }).join(' ')
+
+  return (
+    <div className="mt-6">
+      <div className="mb-2 font-['Montserrat'] text-sm text-white/80">Expected Positive Exposure Profile</div>
+      <svg viewBox={`0 0 ${width} ${height}`} className="w-full max-w-2xl border border-white/10 bg-black/10">
+        <line x1={padding} y1={height - padding} x2={width - padding} y2={height - padding} stroke="rgba(255,255,255,0.25)" />
+        <line x1={padding} y1={padding} x2={padding} y2={height - padding} stroke="rgba(255,255,255,0.25)" />
+        <polyline points={points} fill="none" stroke="rgb(130,199,165)" strokeWidth="3" />
+        {data.map((point, index) => {
+          const value = values[index]
+          const x = padding + (index * (width - padding * 2)) / Math.max(values.length - 1, 1)
+          const y = height - padding - (value / maxValue) * (height - padding * 2)
+
+          return (
+            <g key={`${point.date}-${index}`}>
+              <circle cx={x} cy={y} r="4" fill="rgb(130,199,165)" />
+              <text x={x} y={height - 10} textAnchor="middle" fontSize="10" fill="rgba(255,255,255,0.75)">
+                {point.date?.slice(0, 4) || index + 1}
+              </text>
+            </g>
+          )
+        })}
+      </svg>
     </div>
   )
 }

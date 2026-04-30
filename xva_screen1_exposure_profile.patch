@@ -1,0 +1,186 @@
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -6,7 +6,7 @@
+ from backend.app.modules.trades.routes import router as mvp_router
+ from backend.app.modules.screens.routes import router as screens_router
+ 
+-Base.metadata.drop_all(bind=engine)
++# Base.metadata.drop_all(bind=engine)
+ Base.metadata.create_all(bind=engine)
+ 
+ app = FastAPI(title="XVA Platform MVP")
+--- a/backend/app/modules/screens/routes.py
++++ b/backend/app/modules/screens/routes.py
+@@ -28,6 +28,7 @@
+     currency: str
+     maturity: str
+     direction: str
++    floating_index: str | None = None
+     notional: float
+     fixed_rate: float
+     maturity_override: str | None = None
+@@ -175,7 +176,7 @@
+             effective_date=valuation_date + timedelta(days=2),
+             maturity_date=maturity_date,
+             fixed_rate=request.fixed_rate,
+-            floating_index="SONIA",
++            floating_index=request.floating_index or "SONIA",
+             pay_receive_fixed=request.direction,
+         )
+ 
+@@ -218,15 +219,13 @@
+         cva_amount = epe * marginal_default_probability * lgd * discount_factor
+         cs01 = cva_amount * 0.0114
+ 
+-        exposure_profile = ExposureProfile(
+-            exposure_profile_id=f"EXP-{uuid.uuid4()}",
+-            calculation_run_id=run_id,
+-            time_bucket_date=maturity_date,
+-            expected_exposure=round(epe, 2),
+-            expected_positive_exposure=round(epe, 2),
+-            pfe=round(epe * 2.5, 2),
++        exposure_profile_rows = build_exposure_profile_rows(
++            run_id=run_id,
++            valuation_date=valuation_date,
++            maturity_years=maturity_years,
++            epe=epe,
+             discount_factor=discount_factor,
+-            marginal_default_probability=round(marginal_default_probability, 6),
++            marginal_default_probability=marginal_default_probability,
+         )
+ 
+         cva_result = CvaResult(
+@@ -241,7 +240,7 @@
+         db.add(calculation_run)
+         db.flush()
+ 
+-        db.add(exposure_profile)
++        db.add_all(exposure_profile_rows)
+         db.add(cva_result)
+         db.commit()
+ 
+@@ -271,6 +270,17 @@
+             "currency": request.currency,
+             "cs01": round(cs01, 2),
+             "message": "CVA calculated from submitted trade and database market data",
++            "exposure_profile": [
++                {
++                    "date": str(row.time_bucket_date),
++                    "expected_exposure": row.expected_exposure,
++                    "expected_positive_exposure": row.expected_positive_exposure,
++                    "pfe": row.pfe,
++                    "discount_factor": row.discount_factor,
++                    "marginal_default_probability": row.marginal_default_probability,
++                }
++                for row in exposure_profile_rows
++            ],
+         }
+ 
+     except Exception:
+@@ -279,6 +289,45 @@
+ 
+     finally:
+         db.close()
++
++
++def build_exposure_profile_rows(
++    run_id: str,
++    valuation_date: date,
++    maturity_years: float,
++    epe: float,
++    discount_factor: float,
++    marginal_default_probability: float,
++) -> list[ExposureProfile]:
++    bucket_count = max(int(maturity_years), 1)
++    rows = []
++
++    for bucket in range(1, bucket_count + 1):
++        time_fraction = bucket / bucket_count
++        profile_shape = max(1.0 - ((time_fraction - 0.45) ** 2 * 1.8), 0.2)
++        bucket_epe = epe * profile_shape
++
++        rows.append(
++            ExposureProfile(
++                exposure_profile_id=f"EXP-{uuid.uuid4()}",
++                calculation_run_id=run_id,
++                time_bucket_date=date(
++                    valuation_date.year + bucket,
++                    valuation_date.month,
++                    valuation_date.day,
++                ),
++                expected_exposure=round(bucket_epe, 2),
++                expected_positive_exposure=round(bucket_epe, 2),
++                pfe=round(bucket_epe * 2.5, 2),
++                discount_factor=round(discount_factor, 6),
++                marginal_default_probability=round(
++                    marginal_default_probability * time_fraction,
++                    6,
++                ),
++            )
++        )
++
++    return rows
+ 
+ 
+ def maturity_to_years(maturity: str) -> float:
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -51,6 +51,7 @@
+       currency: form.currency,
+       maturity: form.maturity,
+       direction: form.direction,
++      floating_index: form.floating_index,
+       notional: Number(form.notional),
+       fixed_rate: Number(form.fixed_rate) / 100,
+       maturity_override: null
+@@ -141,8 +142,50 @@
+           <div>CVA: £{Number(result.cva_amount).toLocaleString()}</div>
+           <div>CS01: {result.cs01}</div>
+           <div>Run ID: {result.calculation_run_id}</div>
++          <ExposureChart data={result.exposure_profile || []} />
+         </div>
+       )}
++    </div>
++  )
++}
++
++function ExposureChart({ data }) {
++  if (!data.length) return null
++
++  const width = 560
++  const height = 220
++  const padding = 32
++  const values = data.map(point => Number(point.expected_positive_exposure ?? point.epe ?? 0))
++  const maxValue = Math.max(...values, 1)
++
++  const points = values.map((value, index) => {
++    const x = padding + (index * (width - padding * 2)) / Math.max(values.length - 1, 1)
++    const y = height - padding - (value / maxValue) * (height - padding * 2)
++    return `${x},${y}`
++  }).join(' ')
++
++  return (
++    <div className="mt-6">
++      <div className="mb-2 font-['Montserrat'] text-sm text-white/80">Expected Positive Exposure Profile</div>
++      <svg viewBox={`0 0 ${width} ${height}`} className="w-full max-w-2xl border border-white/10 bg-black/10">
++        <line x1={padding} y1={height - padding} x2={width - padding} y2={height - padding} stroke="rgba(255,255,255,0.25)" />
++        <line x1={padding} y1={padding} x2={padding} y2={height - padding} stroke="rgba(255,255,255,0.25)" />
++        <polyline points={points} fill="none" stroke="rgb(130,199,165)" strokeWidth="3" />
++        {data.map((point, index) => {
++          const value = values[index]
++          const x = padding + (index * (width - padding * 2)) / Math.max(values.length - 1, 1)
++          const y = height - padding - (value / maxValue) * (height - padding * 2)
++
++          return (
++            <g key={`${point.date}-${index}`}>
++              <circle cx={x} cy={y} r="4" fill="rgb(130,199,165)" />
++              <text x={x} y={height - 10} textAnchor="middle" fontSize="10" fill="rgba(255,255,255,0.75)">
++                {point.date?.slice(0, 4) || index + 1}
++              </text>
++            </g>
++          )
++        })}
++      </svg>
+     </div>
+   )
+ }

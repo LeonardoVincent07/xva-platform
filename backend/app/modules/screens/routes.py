@@ -28,6 +28,7 @@ class Screen1Request(BaseModel):
     currency: str
     maturity: str
     direction: str
+    floating_index: str | None = None
     notional: float
     fixed_rate: float
     maturity_override: str | None = None
@@ -175,7 +176,7 @@ def calculate_from_screen1(request: Screen1Request):
             effective_date=valuation_date + timedelta(days=2),
             maturity_date=maturity_date,
             fixed_rate=request.fixed_rate,
-            floating_index="SONIA",
+            floating_index=request.floating_index or "SONIA",
             pay_receive_fixed=request.direction,
         )
 
@@ -218,15 +219,13 @@ def calculate_from_screen1(request: Screen1Request):
         cva_amount = epe * marginal_default_probability * lgd * discount_factor
         cs01 = cva_amount * 0.0114
 
-        exposure_profile = ExposureProfile(
-            exposure_profile_id=f"EXP-{uuid.uuid4()}",
-            calculation_run_id=run_id,
-            time_bucket_date=maturity_date,
-            expected_exposure=round(epe, 2),
-            expected_positive_exposure=round(epe, 2),
-            pfe=round(epe * 2.5, 2),
+        exposure_profile_rows = build_exposure_profile_rows(
+            run_id=run_id,
+            valuation_date=valuation_date,
+            maturity_years=maturity_years,
+            epe=epe,
             discount_factor=discount_factor,
-            marginal_default_probability=round(marginal_default_probability, 6),
+            marginal_default_probability=marginal_default_probability,
         )
 
         cva_result = CvaResult(
@@ -241,7 +240,7 @@ def calculate_from_screen1(request: Screen1Request):
         db.add(calculation_run)
         db.flush()
 
-        db.add(exposure_profile)
+        db.add_all(exposure_profile_rows)
         db.add(cva_result)
         db.commit()
 
@@ -271,6 +270,17 @@ def calculate_from_screen1(request: Screen1Request):
             "currency": request.currency,
             "cs01": round(cs01, 2),
             "message": "CVA calculated from submitted trade and database market data",
+            "exposure_profile": [
+                {
+                    "date": str(row.time_bucket_date),
+                    "expected_exposure": row.expected_exposure,
+                    "expected_positive_exposure": row.expected_positive_exposure,
+                    "pfe": row.pfe,
+                    "discount_factor": row.discount_factor,
+                    "marginal_default_probability": row.marginal_default_probability,
+                }
+                for row in exposure_profile_rows
+            ],
         }
 
     except Exception:
@@ -279,6 +289,45 @@ def calculate_from_screen1(request: Screen1Request):
 
     finally:
         db.close()
+
+
+def build_exposure_profile_rows(
+    run_id: str,
+    valuation_date: date,
+    maturity_years: float,
+    epe: float,
+    discount_factor: float,
+    marginal_default_probability: float,
+) -> list[ExposureProfile]:
+    bucket_count = max(int(maturity_years), 1)
+    rows = []
+
+    for bucket in range(1, bucket_count + 1):
+        time_fraction = bucket / bucket_count
+        profile_shape = max(1.0 - ((time_fraction - 0.45) ** 2 * 1.8), 0.2)
+        bucket_epe = epe * profile_shape
+
+        rows.append(
+            ExposureProfile(
+                exposure_profile_id=f"EXP-{uuid.uuid4()}",
+                calculation_run_id=run_id,
+                time_bucket_date=date(
+                    valuation_date.year + bucket,
+                    valuation_date.month,
+                    valuation_date.day,
+                ),
+                expected_exposure=round(bucket_epe, 2),
+                expected_positive_exposure=round(bucket_epe, 2),
+                pfe=round(bucket_epe * 2.5, 2),
+                discount_factor=round(discount_factor, 6),
+                marginal_default_probability=round(
+                    marginal_default_probability * time_fraction,
+                    6,
+                ),
+            )
+        )
+
+    return rows
 
 
 def maturity_to_years(maturity: str) -> float:
