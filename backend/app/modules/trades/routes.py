@@ -205,36 +205,52 @@ def get_mvp_summary():
 
 
 def seed_existing_irs_trades(db, valuation_date: date):
-    trade_specs = [
-        ("DB-IRS-001", 125_000_000, "USD", 0.0470, "SOFR", "PAY", 1),
-        ("DB-IRS-002", 150_000_000, "USD", 0.0462, "SOFR", "RECEIVE", 2),
-        ("DB-IRS-003", 175_000_000, "USD", 0.0450, "SOFR", "PAY", 3),
-        ("DB-IRS-004", 200_000_000, "USD", 0.0428, "SOFR", "RECEIVE", 5),
-        ("DB-IRS-005", 125_000_000, "USD", 0.0422, "SOFR", "PAY", 7),
-        ("DB-IRS-006", 150_000_000, "USD", 0.0418, "SOFR", "RECEIVE", 10),
-        ("DB-IRS-007", 175_000_000, "USD", 0.0435, "SOFR", "PAY", 4),
-        ("DB-IRS-008", 150_000_000, "USD", 0.0440, "SOFR", "PAY", 6),
-        ("DB-IRS-009", 125_000_000, "USD", 0.0415, "SOFR", "RECEIVE", 8),
-        ("DB-IRS-010", 175_000_000, "USD", 0.0425, "SOFR", "PAY", 12),
-        ("DB-IRS-011", 150_000_000, "USD", 0.0455, "SOFR", "RECEIVE", 2),
-        ("DB-IRS-012", 150_000_000, "USD", 0.0448, "SOFR", "PAY", 3),
-        ("DB-IRS-013", 125_000_000, "USD", 0.0430, "SOFR", "RECEIVE", 5),
-        ("DB-IRS-014", 125_000_000, "USD", 0.0421, "SOFR", "PAY", 9),
-    ]
+    portfolio_specs = {
+        "NS-MS-001": ("MS", 12, 1_950_000_000, "USD", "SOFR"),
+        "NS-JPM-001": ("JPM", 16, 2_850_000_000, "USD", "SOFR"),
+        "NS-DB-001": ("DB", 14, 2_100_000_000, "USD", "SOFR"),
+        "NS-CITI-001": ("CITI", 10, 1_725_000_000, "USD", "SOFR"),
+        "NS-GS-001": ("GS", 13, 2_350_000_000, "USD", "SOFR"),
+        "NS-BARC-001": ("BARC", 11, 1_425_000_000, "GBP", "SONIA"),
+        "NS-BNP-001": ("BNP", 9, 1_260_000_000, "EUR", "EURIBOR"),
+        "NS-UBS-001": ("UBS", 8, 875_000_000, "CHF", "SARON"),
+    }
 
-    for index, (external_id, notional, currency, fixed_rate, floating_index, direction, maturity_years) in enumerate(trade_specs, start=1):
-        db.add(
-            IrsTrade(
-                trade_id=f"IRS-DB-{index:03d}",
-                external_trade_id=external_id,
-                netting_set_id="NS-DB-001",
-                notional=notional,
-                currency=currency,
-                trade_date=valuation_date - timedelta(days=90 + index),
-                effective_date=valuation_date - timedelta(days=88 + index),
-                maturity_date=valuation_date + timedelta(days=365 * maturity_years),
-                fixed_rate=fixed_rate,
-                floating_index=floating_index,
-                pay_receive_fixed=direction,
+    maturity_cycle = [1, 2, 3, 5, 7, 10, 4, 6, 8, 12, 2, 3, 5, 9, 11, 6]
+    direction_cycle = ["PAY", "RECEIVE", "PAY", "RECEIVE", "PAY", "RECEIVE"]
+
+    for netting_set_id, (prefix, trade_count, total_notional, currency, floating_index) in portfolio_specs.items():
+        base_notional = total_notional / trade_count
+        for index in range(1, trade_count + 1):
+            maturity_years = maturity_cycle[(index - 1) % len(maturity_cycle)]
+            direction = direction_cycle[(index - 1) % len(direction_cycle)]
+            notional = round(base_notional * (0.85 + ((index % 5) * 0.075)), 2)
+            fixed_rate = seeded_fixed_rate(currency, maturity_years, index)
+
+            db.add(
+                IrsTrade(
+                    trade_id=f"IRS-{prefix}-{index:03d}",
+                    external_trade_id=f"{prefix}-IRS-{index:03d}",
+                    netting_set_id=netting_set_id,
+                    notional=notional,
+                    currency=currency,
+                    trade_date=valuation_date - timedelta(days=90 + index),
+                    effective_date=valuation_date - timedelta(days=88 + index),
+                    maturity_date=valuation_date + timedelta(days=365 * maturity_years),
+                    fixed_rate=fixed_rate / 100,
+                    floating_index=floating_index,
+                    pay_receive_fixed=direction,
+                )
             )
-        )
+
+
+def seeded_fixed_rate(currency: str, maturity_years: int, index: int) -> float:
+    base = {
+        "USD": 4.28,
+        "EUR": 2.94,
+        "GBP": 4.18,
+        "CHF": 1.20,
+    }.get(currency, 4.28)
+    maturity_adjustment = min(maturity_years, 10) * -0.015
+    trade_adjustment = ((index % 4) - 1.5) * 0.035
+    return round(base + maturity_adjustment + trade_adjustment, 4)

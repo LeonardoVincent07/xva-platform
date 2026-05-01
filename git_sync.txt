@@ -1,3 +1,4 @@
+git status
 git add .
-git commit -m "clear message"
-git push
+git commit -m "Regular git sync"
+git push origin main

@@ -18,6 +18,7 @@ function App() {
   const [options, setOptions] = useState({})
   const [form, setForm] = useState(emptyForm)
   const [result, setResult] = useState(null)
+  const [preview, setPreview] = useState(null)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
@@ -29,12 +30,15 @@ function App() {
           res.data.counterparties?.find((c) => c.name.includes('Deutsche')) ||
           res.data.counterparties?.[0]
 
+        const baseCurrency = defaultCounterparty?.netting_set?.base_currency || 'USD'
+        const indexByCurrency = { USD: 'SOFR', EUR: 'EURIBOR', GBP: 'SONIA', CHF: 'SARON' }
+
         setForm((current) => ({
           ...current,
           counterparty_id: current.counterparty_id || defaultCounterparty?.id || '',
           instrument: res.data.instruments?.[0] || current.instrument,
-          currency: 'USD',
-          floating_index: 'SOFR',
+          currency: current.currency || baseCurrency,
+          floating_index: current.floating_index || indexByCurrency[baseCurrency] || 'SOFR',
           maturity: '5Y',
           direction: 'PAY',
         }))
@@ -45,6 +49,19 @@ function App() {
   const selectedCounterparty = useMemo(() => {
     return options.counterparties?.find((c) => c.id === form.counterparty_id)
   }, [options.counterparties, form.counterparty_id])
+
+  useEffect(() => {
+    if (!form.counterparty_id) {
+      setPreview(null)
+      return
+    }
+
+    axios.get(`${API_BASE}/screens/screen1/context/${form.counterparty_id}`, {
+      params: { currency: form.currency || selectedCounterparty?.netting_set?.base_currency },
+    })
+      .then((res) => setPreview(res.data))
+      .catch((err) => setError(err.response?.data?.detail || err.message))
+  }, [form.counterparty_id, form.currency, selectedCounterparty?.netting_set?.base_currency])
 
   const isValid =
     form.counterparty_id &&
@@ -57,8 +74,30 @@ function App() {
     form.direction
 
   const handleChange = (e) => {
-    setForm({ ...form, [e.target.name]: e.target.value })
+    const { name, value } = e.target
+    setResult(null)
     setError('')
+
+    if (name === 'counterparty_id') {
+      const cp = options.counterparties?.find((c) => c.id === value)
+      const baseCurrency = cp?.netting_set?.base_currency || form.currency
+      const indexByCurrency = { USD: 'SOFR', EUR: 'EURIBOR', GBP: 'SONIA', CHF: 'SARON' }
+      setForm({
+        ...form,
+        counterparty_id: value,
+        currency: baseCurrency,
+        floating_index: indexByCurrency[baseCurrency] || form.floating_index,
+      })
+      return
+    }
+
+    if (name === 'currency') {
+      const indexByCurrency = { USD: 'SOFR', EUR: 'EURIBOR', GBP: 'SONIA', CHF: 'SARON' }
+      setForm({ ...form, currency: value, floating_index: indexByCurrency[value] || form.floating_index })
+      return
+    }
+
+    setForm({ ...form, [name]: value })
   }
 
   const calculate = () => {
@@ -83,7 +122,8 @@ function App() {
       .finally(() => setLoading(false))
   }
 
-  const nettingSet = result?.netting_set || selectedCounterparty?.netting_set
+  const displayData = result || preview
+  const nettingSet = displayData?.netting_set || selectedCounterparty?.netting_set
   const parRate = result?.par_rate_pct ?? options.par_rates?.[form.currency]?.[form.maturity]
 
   return (
@@ -191,11 +231,11 @@ function App() {
             )}
           </div>
 
-          <ExposureChart data={result?.exposure_profile || []} currency={form.currency} />
+          <ExposureChart data={displayData?.exposure_profile || []} currency={form.currency} />
 
           <div className="mt-6 grid gap-6 lg:grid-cols-[1.05fr_0.95fr]">
-            <CompositionTable rows={result?.netting_set_composition} currency={form.currency} />
-            <ParRates rates={result?.par_rates || options.par_rates?.[form.currency]} currency={form.currency} index={form.floating_index} />
+            <CompositionTable rows={displayData?.netting_set_composition} currency={form.currency} />
+            <ParRates rates={displayData?.par_rates || options.par_rates?.[form.currency]} currency={form.currency} index={form.floating_index} />
           </div>
         </section>
       </main>
