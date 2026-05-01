@@ -52,8 +52,8 @@ export default function App() {
           ...current,
           counterparty_id: current.counterparty_id || defaultCounterparty?.id || '',
           instrument: res.data.instruments?.[0] || current.instrument,
-          currency: current.currency || baseCurrency,
-          floating_index: current.floating_index || indexByCurrency[baseCurrency] || 'SOFR',
+          currency: baseCurrency,
+          floating_index: indexByCurrency[baseCurrency] || 'SOFR',
           maturity: current.maturity || '5Y',
           direction: current.direction || 'PAY',
         }))
@@ -72,12 +72,24 @@ export default function App() {
     }
 
     axios
-      .get(`${API_BASE}/screens/screen1/context/${form.counterparty_id}`, {
-        params: { currency: form.currency || selectedCounterparty?.netting_set?.base_currency },
+      .get(`${API_BASE}/screens/screen1/context/${form.counterparty_id}`)
+      .then((res) => {
+        setPreview(res.data)
+
+        const baseCurrency =
+          res.data?.netting_set?.base_currency ||
+          selectedCounterparty?.netting_set?.base_currency ||
+          form.currency ||
+          'USD'
+
+        setForm((current) => ({
+          ...current,
+          currency: baseCurrency,
+          floating_index: indexByCurrency[baseCurrency] || current.floating_index || 'SOFR',
+        }))
       })
-      .then((res) => setPreview(res.data))
       .catch((err) => setError(err.response?.data?.detail || err.message))
-  }, [form.counterparty_id, form.currency, selectedCounterparty?.netting_set?.base_currency])
+  }, [form.counterparty_id])
 
   const isValid = Boolean(
     form.counterparty_id &&
