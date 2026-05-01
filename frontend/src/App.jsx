@@ -205,7 +205,7 @@ export default function App() {
             />
 
             <div className="grid min-h-0 gap-5 2xl:grid-cols-[1fr_420px]">
-              <XvaMetrics result={result} currency={form.currency} />
+              <XvaMetrics result={result} currency={form.currency} notional={form.notional} />
               <MarketDataPanel
                 parRates={parRates}
                 currency={form.currency}

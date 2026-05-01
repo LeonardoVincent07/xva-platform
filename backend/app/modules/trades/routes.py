@@ -102,14 +102,23 @@ def seed_mvp_dataset():
 
         db.flush()
 
+        par_rate_curves = {
+            "USD": {"1Y": 4.86, "2Y": 4.64, "3Y": 4.49, "5Y": 4.29, "7Y": 4.23, "10Y": 4.19},
+            "EUR": {"1Y": 4.12, "2Y": 3.91, "3Y": 3.77, "5Y": 3.59, "7Y": 3.48, "10Y": 3.37},
+            "GBP": {"1Y": 4.73, "2Y": 4.45, "3Y": 4.32, "5Y": 4.17, "7Y": 4.09, "10Y": 4.01},
+            "CHF": {"1Y": 1.91, "2Y": 1.77, "3Y": 1.68, "5Y": 1.54, "7Y": 1.47, "10Y": 1.41},
+        }
+
         discount_curve_defs = [
-            ("USD", "SOFR", 0.86),
-            ("EUR", "EURIBOR", 0.89),
-            ("GBP", "SONIA", 0.87),
-            ("CHF", "SARON", 0.92),
+            ("USD", "SOFR"),
+            ("EUR", "EURIBOR"),
+            ("GBP", "SONIA"),
+            ("CHF", "SARON"),
         ]
 
-        for currency, floating_index, discount_factor in discount_curve_defs:
+        tenor_years = {"1Y": 1, "2Y": 2, "3Y": 3, "5Y": 5, "7Y": 7, "10Y": 10}
+
+        for currency, floating_index in discount_curve_defs:
             curve_id = f"CURVE-{currency}-DISCOUNT-001"
 
             db.add(
@@ -117,22 +126,37 @@ def seed_mvp_dataset():
                     curve_id=curve_id,
                     market_data_snapshot_id="MD-001",
                     curve_type="DISCOUNT",
-                    curve_name=f"{currency} {floating_index} Discount",
+                    curve_name=f"{currency} {floating_index} Discount / Par",
                     currency=currency,
                     floating_index=floating_index,
                 )
             )
 
-            db.add(
-                CurvePoint(
-                    curve_point_id=f"{curve_id}-5Y",
-                    curve_id=curve_id,
-                    tenor="5Y",
-                    maturity_date=valuation_date + timedelta(days=365 * 5),
-                    value=discount_factor,
-                    value_type="DISCOUNT_FACTOR",
+            for tenor, years in tenor_years.items():
+                par_rate_pct = par_rate_curves[currency][tenor]
+                annual_rate = par_rate_pct / 100
+                discount_factor = 1 / ((1 + annual_rate) ** years)
+
+                db.add(
+                    CurvePoint(
+                        curve_point_id=f"{curve_id}-{tenor}-DF",
+                        curve_id=curve_id,
+                        tenor=tenor,
+                        maturity_date=valuation_date + timedelta(days=365 * years),
+                        value=round(discount_factor, 6),
+                        value_type="DISCOUNT_FACTOR",
+                    )
                 )
-            )
+                db.add(
+                    CurvePoint(
+                        curve_point_id=f"{curve_id}-{tenor}-PAR",
+                        curve_id=curve_id,
+                        tenor=tenor,
+                        maturity_date=valuation_date + timedelta(days=365 * years),
+                        value=par_rate_pct,
+                        value_type="PAR_RATE_PCT",
+                    )
+                )
 
         credit_spreads = {
             "CP-001": 0.0110,
@@ -159,25 +183,75 @@ def seed_mvp_dataset():
                 )
             )
 
-            db.add(
-                CurvePoint(
-                    curve_point_id=f"{curve_id}-5Y",
-                    curve_id=curve_id,
-                    tenor="5Y",
-                    maturity_date=valuation_date + timedelta(days=365 * 5),
-                    value=credit_spreads[cp_id],
-                    value_type="CREDIT_SPREAD",
+            for tenor, years in tenor_years.items():
+                spread = credit_spreads[cp_id] * (1 + 0.035 * math.log1p(years))
+                db.add(
+                    CurvePoint(
+                        curve_point_id=f"{curve_id}-{tenor}",
+                        curve_id=curve_id,
+                        tenor=tenor,
+                        maturity_date=valuation_date + timedelta(days=365 * years),
+                        value=round(spread, 6),
+                        value_type="CREDIT_SPREAD",
+                    )
                 )
-            )
 
+            recovery_by_currency = {"USD": 0.40, "EUR": 0.38, "GBP": 0.41, "CHF": 0.42}
             db.add(
                 RecoveryRate(
                     recovery_rate_id=f"REC-{cp_id}",
                     counterparty_id=cp_id,
                     market_data_snapshot_id="MD-001",
-                    recovery_rate=0.4,
+                    recovery_rate=recovery_by_currency.get(base_currency, 0.40),
                 )
             )
+
+        trade_maturity_ladder = [1, 2, 3, 5, 7, 10]
+        direction_ladder = ["PAY", "RECEIVE"]
+        notional_ladder = [25_000_000, 40_000_000, 55_000_000, 75_000_000, 100_000_000, 125_000_000]
+        base_trade_counts = {
+            "CP-001": 58,
+            "CP-002": 64,
+            "CP-003": 51,
+            "CP-004": 46,
+            "CP-005": 55,
+            "CP-006": 38,
+            "CP-007": 44,
+            "CP-008": 34,
+        }
+
+        for cp_id, _name, _lei, base_currency in counterparties:
+            netting_set_id = f"NS-{cp_id}"
+            floating_index = {
+                "USD": "SOFR",
+                "EUR": "EURIBOR",
+                "GBP": "SONIA",
+                "CHF": "SARON",
+            }.get(base_currency, "SOFR")
+
+            for i in range(base_trade_counts[cp_id]):
+                years = trade_maturity_ladder[(i + len(cp_id)) % len(trade_maturity_ladder)]
+                notional = notional_ladder[(i * 2 + len(base_currency)) % len(notional_ladder)]
+                direction = direction_ladder[i % 2]
+                par_rate = par_rate_curves[base_currency][f"{years}Y"]
+                rate_offset = ((i % 7) - 3) * 0.035
+                fixed_rate = round((par_rate + rate_offset) / 100, 6)
+
+                db.add(
+                    IrsTrade(
+                        trade_id=f"TRD-{cp_id}-{i + 1:03d}",
+                        external_trade_id=f"M7-{base_currency}-{cp_id[-3:]}-{i + 1:05d}",
+                        netting_set_id=netting_set_id,
+                        notional=notional,
+                        currency=base_currency,
+                        trade_date=valuation_date - timedelta(days=7 + (i % 19)),
+                        effective_date=valuation_date - timedelta(days=i % 5),
+                        maturity_date=valuation_date + timedelta(days=365 * years),
+                        fixed_rate=fixed_rate,
+                        floating_index=floating_index,
+                        pay_receive_fixed=direction,
+                    )
+                )
 
         db.commit()
 
@@ -190,6 +264,7 @@ def seed_mvp_dataset():
                 "curves": db.query(Curve).count(),
                 "curve_points": db.query(CurvePoint).count(),
                 "recovery_rates": db.query(RecoveryRate).count(),
+                "irs_trades": db.query(IrsTrade).count(),
                 "cva_results": db.query(CvaResult).count(),
             },
         }
