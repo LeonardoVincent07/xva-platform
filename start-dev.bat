@@ -7,4 +7,8 @@ start "XVA Backend" cmd /k "py -3.12 -m uvicorn backend.app.main:app --host 127.
 echo Starting XVA frontend...
 start "XVA Frontend" cmd /k "cd frontend && npm run dev"
 
+timeout /t 5 > nul
+
+start http://localhost:5173
+
 echo Done.
