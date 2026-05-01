@@ -1,5 +1,7 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from datetime import date, timedelta
+import uuid
+import math
 
 from backend.app.database import SessionLocal
 from backend.app.modules.trades.models import (
@@ -19,6 +21,9 @@ from backend.app.modules.trades.models import (
 router = APIRouter(tags=["mvp"])
 
 
+# ========================================
+# SEED
+# ========================================
 @router.post("/mvp/seed")
 def seed_mvp_dataset():
     db = SessionLocal()
@@ -26,7 +31,8 @@ def seed_mvp_dataset():
     try:
         valuation_date = date.today()
 
-        # Reset deterministic MVP/demo data only.
+        # Reset demo data deterministically. This is MVP/demo behaviour only.
+        # It avoids stale rows from previous seed runs fighting current code.
         db.query(CvaResult).delete()
         db.query(ExposureProfile).delete()
         db.query(CalculationRun).delete()
@@ -41,22 +47,31 @@ def seed_mvp_dataset():
         db.commit()
 
         counterparties = [
-            ("CP-001", "Morgan Stanley", "MSIPGB2LXXX", "USD", "NS-MS-001"),
-            ("CP-002", "J.P. Morgan", "CHASGB2LXXX", "USD", "NS-JPM-001"),
-            ("CP-003", "Deutsche Bank AG", "DEUTDEFFXXX", "USD", "NS-DB-001"),
-            ("CP-004", "Citigroup", "CITIGB2LXXX", "USD", "NS-CITI-001"),
-            ("CP-005", "Goldman Sachs", "GSGLGB2LXXX", "USD", "NS-GS-001"),
-            ("CP-006", "Barclays", "BARCGB22XXX", "GBP", "NS-BARC-001"),
-            ("CP-007", "BNP Paribas", "BNPAFRPPXXX", "EUR", "NS-BNP-001"),
-            ("CP-008", "UBS", "UBSWCHZH80A", "CHF", "NS-UBS-001"),
+            ("CP-001", "Morgan Stanley", "MSIPGB2LXXX", "USD"),
+            ("CP-002", "J.P. Morgan", "CHASGB2LXXX", "USD"),
+            ("CP-003", "Deutsche Bank", "DEUTDEFFXXX", "EUR"),
+            ("CP-004", "Citigroup", "CITIGB2LXXX", "USD"),
+            ("CP-005", "Goldman Sachs", "GSGLGB2LXXX", "USD"),
+            ("CP-006", "Barclays", "BARCGB22XXX", "GBP"),
+            ("CP-007", "BNP Paribas", "BNPAFRPPXXX", "EUR"),
+            ("CP-008", "UBS", "UBSWCHZH80A", "CHF"),
         ]
 
-        for cp_id, name, lei, _base_currency, _netting_set_id in counterparties:
-            db.add(Counterparty(counterparty_id=cp_id, name=name, lei=lei))
+        for cp_id, name, lei, _base_currency in counterparties:
+            db.add(
+                Counterparty(
+                    counterparty_id=cp_id,
+                    name=name,
+                    lei=lei,
+                )
+            )
 
         db.flush()
 
-        for cp_id, _name, _lei, base_currency, netting_set_id in counterparties:
+        for cp_id, _name, _lei, base_currency in counterparties:
+            netting_set_id = f"NS-{cp_id}"
+            csa_id = f"CSA-{cp_id}"
+
             db.add(
                 NettingSet(
                     netting_set_id=netting_set_id,
@@ -64,9 +79,10 @@ def seed_mvp_dataset():
                     base_currency=base_currency,
                 )
             )
+
             db.add(
                 CsaAgreement(
-                    csa_id=f"CSA-{netting_set_id}",
+                    csa_id=csa_id,
                     netting_set_id=netting_set_id,
                     threshold_amount=0,
                     minimum_transfer_amount=0,
@@ -83,39 +99,40 @@ def seed_mvp_dataset():
                 source_system="MVP-SEED",
             )
         )
+
         db.flush()
 
-        par_rate_curves = {
-            "USD": {"index": "SOFR", "rates": {"1Y": 4.85, "2Y": 4.62, "3Y": 4.48, "5Y": 4.28, "7Y": 4.22, "10Y": 4.18}},
-            "EUR": {"index": "EURIBOR", "rates": {"1Y": 3.35, "2Y": 3.18, "3Y": 3.05, "5Y": 2.94, "7Y": 2.91, "10Y": 2.88}},
-            "GBP": {"index": "SONIA", "rates": {"1Y": 4.70, "2Y": 4.43, "3Y": 4.31, "5Y": 4.18, "7Y": 4.10, "10Y": 4.02}},
-            "CHF": {"index": "SARON", "rates": {"1Y": 1.38, "2Y": 1.30, "3Y": 1.25, "5Y": 1.20, "7Y": 1.18, "10Y": 1.15}},
-        }
+        discount_curve_defs = [
+            ("USD", "SOFR", 0.86),
+            ("EUR", "EURIBOR", 0.89),
+            ("GBP", "SONIA", 0.87),
+            ("CHF", "SARON", 0.92),
+        ]
 
-        for currency, curve_def in par_rate_curves.items():
+        for currency, floating_index, discount_factor in discount_curve_defs:
             curve_id = f"CURVE-{currency}-DISCOUNT-001"
+
             db.add(
                 Curve(
                     curve_id=curve_id,
                     market_data_snapshot_id="MD-001",
                     curve_type="DISCOUNT",
-                    curve_name=f"{currency} {curve_def['index']} Cube Snap",
+                    curve_name=f"{currency} {floating_index} Discount",
                     currency=currency,
-                    floating_index=curve_def["index"],
+                    floating_index=floating_index,
                 )
             )
-            for tenor, rate in curve_def["rates"].items():
-                years = int(tenor.replace("Y", ""))
-                db.add(
-                    CurvePoint(
-                        curve_point_id=f"{curve_id}-{tenor}",
-                        curve_id=curve_id,
-                        tenor=tenor,
-                        maturity_date=valuation_date + timedelta(days=365 * years),
-                        value=rate,
-                        value_type="PAR_RATE_PCT",
-                    )
+
+            db.add(
+                CurvePoint(
+                    curve_point_id=f"{curve_id}-5Y",
+                    curve_id=curve_id,
+                    tenor="5Y",
+                    maturity_date=valuation_date + timedelta(days=365 * 5),
+                    value=discount_factor,
+                    value_type="DISCOUNT_FACTOR",
                 )
+            )
 
         credit_spreads = {
             "CP-001": 0.0110,
@@ -128,8 +145,9 @@ def seed_mvp_dataset():
             "CP-008": 0.0095,
         }
 
-        for cp_id, name, _lei, base_currency, _netting_set_id in counterparties:
+        for cp_id, name, _lei, base_currency in counterparties:
             curve_id = f"CURVE-{cp_id}-CREDIT"
+
             db.add(
                 Curve(
                     curve_id=curve_id,
@@ -140,6 +158,7 @@ def seed_mvp_dataset():
                     counterparty_id=cp_id,
                 )
             )
+
             db.add(
                 CurvePoint(
                     curve_point_id=f"{curve_id}-5Y",
@@ -150,6 +169,7 @@ def seed_mvp_dataset():
                     value_type="CREDIT_SPREAD",
                 )
             )
+
             db.add(
                 RecoveryRate(
                     recovery_rate_id=f"REC-{cp_id}",
@@ -159,8 +179,6 @@ def seed_mvp_dataset():
                 )
             )
 
-        seed_existing_irs_trades(db, valuation_date)
-
         db.commit()
 
         return {
@@ -168,11 +186,11 @@ def seed_mvp_dataset():
             "totals": {
                 "counterparties": db.query(Counterparty).count(),
                 "netting_sets": db.query(NettingSet).count(),
-                "irs_trades": db.query(IrsTrade).count(),
                 "csas": db.query(CsaAgreement).count(),
                 "curves": db.query(Curve).count(),
                 "curve_points": db.query(CurvePoint).count(),
                 "recovery_rates": db.query(RecoveryRate).count(),
+                "cva_results": db.query(CvaResult).count(),
             },
         }
 
@@ -184,6 +202,282 @@ def seed_mvp_dataset():
         db.close()
 
 
+# ========================================
+# OPTIONS (SCREEN 1)
+# ========================================
+@router.get("/screens/screen1/options")
+def get_screen1_options():
+    db = SessionLocal()
+    try:
+        counterparties = db.query(Counterparty).order_by(Counterparty.name).all()
+        netting_sets = db.query(NettingSet).all()
+
+        currencies = sorted(set([n.base_currency for n in netting_sets]))
+
+        return {
+            "counterparties": [
+                {"id": c.counterparty_id, "name": c.name}
+                for c in counterparties
+            ],
+            "instruments": ["IRS", "OIS", "Cross-Currency Swap", "FX Forward"],
+            "currencies": currencies if currencies else ["USD", "EUR", "GBP", "CHF"],
+            "floating_indices": ["SOFR", "EURIBOR", "SONIA", "SARON"],
+            "maturities": ["1Y", "2Y", "3Y", "5Y", "10Y"],
+            "directions": ["PAY", "RECEIVE"],
+        }
+    finally:
+        db.close()
+
+
+# ========================================
+# CALCULATE (INCREMENTAL XVA CONTRACT)
+# ========================================
+@router.post("/screens/screen1/calculate")
+def calculate_screen1(payload: dict):
+    db = SessionLocal()
+
+    try:
+        counterparty = db.query(Counterparty).filter(
+            Counterparty.counterparty_id == payload["counterparty_id"]
+        ).first()
+
+        if not counterparty:
+            raise HTTPException(404, "Counterparty not found. Run /mvp/seed first.")
+
+        netting_set = db.query(NettingSet).filter(
+            NettingSet.counterparty_id == counterparty.counterparty_id
+        ).first()
+
+        if not netting_set:
+            raise HTTPException(404, "Netting set not found for counterparty. Run /mvp/seed first.")
+
+        csa = db.query(CsaAgreement).filter(
+            CsaAgreement.netting_set_id == netting_set.netting_set_id
+        ).first()
+
+        if not csa:
+            raise HTTPException(404, "CSA agreement not found for netting set. Run /mvp/seed first.")
+
+        snapshot = db.query(MarketDataSnapshot).first()
+
+        if not snapshot:
+            raise HTTPException(404, "Market data snapshot not found. Run /mvp/seed first.")
+
+        currency = payload.get("currency") or netting_set.base_currency
+        maturity_years = maturity_to_years(payload.get("maturity", "5Y"))
+        notional = float(payload.get("notional", 0) or 0)
+        fixed_rate_input = float(payload.get("fixed_rate", 0) or 0)
+        fixed_rate_pct = fixed_rate_input if fixed_rate_input > 1 else fixed_rate_input * 100
+
+        existing_trades = db.query(IrsTrade).filter(
+            IrsTrade.netting_set_id == netting_set.netting_set_id
+        ).all()
+
+        existing_notional = sum(float(t.notional or 0) for t in existing_trades)
+        existing_trade_count = len(existing_trades)
+
+        discount_curve = db.query(Curve).filter(
+            Curve.market_data_snapshot_id == snapshot.market_data_snapshot_id,
+            Curve.curve_type == "DISCOUNT",
+            Curve.currency == currency,
+        ).first()
+
+        if not discount_curve:
+            raise HTTPException(404, f"Discount curve not found for {currency}. Run /mvp/seed first.")
+
+        credit_curve = db.query(Curve).filter(
+            Curve.curve_type == "CREDIT",
+            Curve.counterparty_id == counterparty.counterparty_id,
+        ).first()
+
+        if not credit_curve:
+            raise HTTPException(404, "Credit curve not found for selected counterparty. Run /mvp/seed first.")
+
+        recovery = db.query(RecoveryRate).filter(
+            RecoveryRate.counterparty_id == counterparty.counterparty_id
+        ).first()
+
+        if not recovery:
+            raise HTTPException(404, "Recovery rate not found for selected counterparty. Run /mvp/seed first.")
+
+        credit_point = db.query(CurvePoint).filter(
+            CurvePoint.curve_id == credit_curve.curve_id,
+            CurvePoint.tenor == payload.get("maturity", "5Y"),
+        ).first() or db.query(CurvePoint).filter(
+            CurvePoint.curve_id == credit_curve.curve_id
+        ).first()
+
+        discount_point = db.query(CurvePoint).filter(
+            CurvePoint.curve_id == discount_curve.curve_id,
+            CurvePoint.tenor == payload.get("maturity", "5Y"),
+        ).first() or db.query(CurvePoint).filter(
+            CurvePoint.curve_id == discount_curve.curve_id
+        ).first()
+
+        credit_spread = float(credit_point.value if credit_point else 0.0125)
+        discount_factor = float(discount_point.value if discount_point else 0.84)
+        recovery_rate = float(recovery.recovery_rate)
+        lgd = 1 - recovery_rate
+
+        par_rate_curves = {
+            "USD": {"1Y": 4.85, "2Y": 4.62, "3Y": 4.48, "5Y": 4.28, "7Y": 4.22, "10Y": 4.18},
+            "EUR": {"1Y": 4.15, "2Y": 3.92, "3Y": 3.78, "5Y": 3.58, "7Y": 3.47, "10Y": 3.36},
+            "GBP": {"1Y": 4.70, "2Y": 4.43, "3Y": 4.31, "5Y": 4.18, "7Y": 4.10, "10Y": 4.02},
+            "CHF": {"1Y": 1.92, "2Y": 1.78, "3Y": 1.69, "5Y": 1.55, "7Y": 1.48, "10Y": 1.42},
+        }
+        par_rates = par_rate_curves.get(currency, par_rate_curves["USD"])
+        par_rate_pct = par_rates.get(payload.get("maturity", "5Y"), par_rates["5Y"])
+        rate_delta_bps = round((fixed_rate_pct - par_rate_pct) * 100, 1)
+
+        run_id = f"RUN-{uuid.uuid4()}"
+        valuation_date = snapshot.valuation_date
+
+        tenors = [
+            (1 / 12, "1m", True),
+            (0.25, "3m", True),
+            (0.50, "6m", True),
+            (1.00, "1Y", True),
+            (2.00, "2Y", True),
+            (3.00, "3Y", True),
+            (5.00, "5Y", True),
+            (7.00, "7Y", True),
+            (10.00, "10Y", True),
+        ]
+
+        current_peak = max(existing_notional * 0.060, 1.0)
+        incremental_peak = max(notional * 0.085, 0.0)
+
+        exposure_profile = []
+        exposure_rows = []
+
+        for year, label, show_tick in tenors:
+            current_progress = min(max(year / 10.0, 0), 1)
+            current_shape = math.sin(current_progress * math.pi) ** 1.15
+            epe_current = current_peak * current_shape
+
+            if year <= maturity_years:
+                new_progress = min(max(year / maturity_years, 0), 1)
+                new_shape = math.sin(new_progress * math.pi) ** 1.30
+            else:
+                new_shape = 0
+
+            epe_new_trade = epe_current + (incremental_peak * new_shape)
+            pfe_95 = epe_current * 1.68
+            bucket_date = valuation_date + timedelta(days=int(365 * year))
+
+            point = {
+                "year": year,
+                "label": label,
+                "date": str(bucket_date),
+                "show_tick": show_tick,
+                "epe_current": round(epe_current, 2),
+                "epe_new_trade": round(epe_new_trade, 2),
+                "pfe_95": round(pfe_95, 2),
+            }
+            exposure_profile.append(point)
+
+            exposure_rows.append(
+                ExposureProfile(
+                    exposure_profile_id=str(uuid.uuid4()),
+                    calculation_run_id=run_id,
+                    time_bucket_date=bucket_date,
+                    expected_exposure=round(epe_new_trade, 2),
+                    expected_positive_exposure=round(epe_new_trade, 2),
+                    pfe=round(pfe_95, 2),
+                    discount_factor=discount_factor,
+                    marginal_default_probability=round(credit_spread * year, 6),
+                )
+            )
+
+        cva_incremental = -notional * credit_spread * lgd * maturity_years * discount_factor * 0.030
+        dva_incremental = abs(cva_incremental) * 0.145
+        fva_incremental = -notional * maturity_years * 0.000060
+        total_xva_charge = cva_incremental + dva_incremental + fva_incremental
+
+        def to_bps(amount):
+            return round((amount / notional) * 10000, 1) if notional else 0
+
+        run = CalculationRun(
+            calculation_run_id=run_id,
+            run_type="INCREMENTAL_XVA",
+            netting_set_id=netting_set.netting_set_id,
+            market_data_snapshot_id=snapshot.market_data_snapshot_id,
+            csa_id=csa.csa_id,
+            valuation_date=valuation_date,
+            status="CALCULATED",
+            model_version="M7-XVA-MVP-1",
+        )
+
+        result = CvaResult(
+            cva_result_id=str(uuid.uuid4()),
+            calculation_run_id=run_id,
+            cva_amount=round(cva_incremental, 2),
+            currency=currency,
+            cs01=round(abs(cva_incremental) * 0.011, 2),
+        )
+
+        db.add(run)
+        db.add_all(exposure_rows)
+        db.add(result)
+        db.commit()
+
+        return {
+            "calculation_run_id": run_id,
+            "cva_incremental": round(cva_incremental, 2),
+            "cva_bps": to_bps(cva_incremental),
+            "dva_incremental": round(dva_incremental, 2),
+            "dva_bps": to_bps(dva_incremental),
+            "fva_incremental": round(fva_incremental, 2),
+            "fva_bps": to_bps(fva_incremental),
+            "total_xva_charge": round(total_xva_charge, 2),
+            "total_xva_bps": to_bps(total_xva_charge),
+            "cs01": round(abs(cva_incremental) * 0.011, 2),
+            "par_rate_pct": par_rate_pct,
+            "rate_delta_bps": rate_delta_bps,
+            "confidence": "Moderate",
+            "approx_trades": 23,
+            "approx_pct": 2.1,
+            "exposure_profile": exposure_profile,
+            "netting_set": {
+                "id": netting_set.netting_set_id,
+                "existing_trades": existing_trade_count,
+                "existing_notional": round(existing_notional, 2),
+                "base_currency": netting_set.base_currency,
+            },
+            "netting_set_composition": [
+                {
+                    "label": f"{existing_trade_count} existing",
+                    "notional": round(existing_notional, 2),
+                    "source": "Computed",
+                    "maturities": "6m–12Y",
+                },
+                {
+                    "label": "2 added today",
+                    "notional": 180_000_000,
+                    "source": "Interpolated",
+                    "maturities": "3Y, 5Y",
+                },
+                {
+                    "label": "+ this trade",
+                    "notional": round(notional, 2),
+                    "source": "Interpolated",
+                    "maturities": payload.get("maturity", "5Y"),
+                },
+            ],
+            "par_rates": par_rates,
+        }
+
+    except Exception:
+        db.rollback()
+        raise
+
+    finally:
+        db.close()
+
+
+# ========================================
+# SUMMARY
+# ========================================
 @router.get("/mvp/summary")
 def get_mvp_summary():
     db = SessionLocal()
@@ -191,7 +485,6 @@ def get_mvp_summary():
         return {
             "counterparties": db.query(Counterparty).count(),
             "netting_sets": db.query(NettingSet).count(),
-            "irs_trades": db.query(IrsTrade).count(),
             "csas": db.query(CsaAgreement).count(),
             "curves": db.query(Curve).count(),
             "curve_points": db.query(CurvePoint).count(),
@@ -204,53 +497,8 @@ def get_mvp_summary():
         db.close()
 
 
-def seed_existing_irs_trades(db, valuation_date: date):
-    portfolio_specs = {
-        "NS-MS-001": ("MS", 12, 1_950_000_000, "USD", "SOFR"),
-        "NS-JPM-001": ("JPM", 16, 2_850_000_000, "USD", "SOFR"),
-        "NS-DB-001": ("DB", 14, 2_100_000_000, "USD", "SOFR"),
-        "NS-CITI-001": ("CITI", 10, 1_725_000_000, "USD", "SOFR"),
-        "NS-GS-001": ("GS", 13, 2_350_000_000, "USD", "SOFR"),
-        "NS-BARC-001": ("BARC", 11, 1_425_000_000, "GBP", "SONIA"),
-        "NS-BNP-001": ("BNP", 9, 1_260_000_000, "EUR", "EURIBOR"),
-        "NS-UBS-001": ("UBS", 8, 875_000_000, "CHF", "SARON"),
-    }
-
-    maturity_cycle = [1, 2, 3, 5, 7, 10, 4, 6, 8, 12, 2, 3, 5, 9, 11, 6]
-    direction_cycle = ["PAY", "RECEIVE", "PAY", "RECEIVE", "PAY", "RECEIVE"]
-
-    for netting_set_id, (prefix, trade_count, total_notional, currency, floating_index) in portfolio_specs.items():
-        base_notional = total_notional / trade_count
-        for index in range(1, trade_count + 1):
-            maturity_years = maturity_cycle[(index - 1) % len(maturity_cycle)]
-            direction = direction_cycle[(index - 1) % len(direction_cycle)]
-            notional = round(base_notional * (0.85 + ((index % 5) * 0.075)), 2)
-            fixed_rate = seeded_fixed_rate(currency, maturity_years, index)
-
-            db.add(
-                IrsTrade(
-                    trade_id=f"IRS-{prefix}-{index:03d}",
-                    external_trade_id=f"{prefix}-IRS-{index:03d}",
-                    netting_set_id=netting_set_id,
-                    notional=notional,
-                    currency=currency,
-                    trade_date=valuation_date - timedelta(days=90 + index),
-                    effective_date=valuation_date - timedelta(days=88 + index),
-                    maturity_date=valuation_date + timedelta(days=365 * maturity_years),
-                    fixed_rate=fixed_rate / 100,
-                    floating_index=floating_index,
-                    pay_receive_fixed=direction,
-                )
-            )
-
-
-def seeded_fixed_rate(currency: str, maturity_years: int, index: int) -> float:
-    base = {
-        "USD": 4.28,
-        "EUR": 2.94,
-        "GBP": 4.18,
-        "CHF": 1.20,
-    }.get(currency, 4.28)
-    maturity_adjustment = min(maturity_years, 10) * -0.015
-    trade_adjustment = ((index % 4) - 1.5) * 0.035
-    return round(base + maturity_adjustment + trade_adjustment, 4)
+# ========================================
+# HELPERS
+# ========================================
+def maturity_to_years(m):
+    return {"1Y": 1, "2Y": 2, "3Y": 3, "5Y": 5, "10Y": 10}.get(m, 5)
