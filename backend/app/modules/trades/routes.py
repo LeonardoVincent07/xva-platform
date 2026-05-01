@@ -1,7 +1,5 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from datetime import date, timedelta
-import uuid
-import math
 
 from backend.app.database import SessionLocal
 from backend.app.modules.trades.models import (
@@ -21,9 +19,6 @@ from backend.app.modules.trades.models import (
 router = APIRouter(tags=["mvp"])
 
 
-# ========================================
-# SEED
-# ========================================
 @router.post("/mvp/seed")
 def seed_mvp_dataset():
     db = SessionLocal()
@@ -31,6 +26,7 @@ def seed_mvp_dataset():
     try:
         valuation_date = date.today()
 
+        # Reset deterministic MVP/demo data only.
         db.query(CvaResult).delete()
         db.query(ExposureProfile).delete()
         db.query(CalculationRun).delete()
@@ -45,76 +41,81 @@ def seed_mvp_dataset():
         db.commit()
 
         counterparties = [
-            ("CP-001", "Morgan Stanley", "MSIPGB2LXXX", "USD"),
-            ("CP-002", "J.P. Morgan", "CHASGB2LXXX", "USD"),
-            ("CP-003", "Deutsche Bank", "DEUTDEFFXXX", "EUR"),
-            ("CP-004", "Citigroup", "CITIGB2LXXX", "USD"),
-            ("CP-005", "Goldman Sachs", "GSGLGB2LXXX", "USD"),
-            ("CP-006", "Barclays", "BARCGB22XXX", "GBP"),
-            ("CP-007", "BNP Paribas", "BNPAFRPPXXX", "EUR"),
-            ("CP-008", "UBS", "UBSWCHZH80A", "CHF"),
+            ("CP-001", "Morgan Stanley", "MSIPGB2LXXX", "USD", "NS-MS-001"),
+            ("CP-002", "J.P. Morgan", "CHASGB2LXXX", "USD", "NS-JPM-001"),
+            ("CP-003", "Deutsche Bank AG", "DEUTDEFFXXX", "USD", "NS-DB-001"),
+            ("CP-004", "Citigroup", "CITIGB2LXXX", "USD", "NS-CITI-001"),
+            ("CP-005", "Goldman Sachs", "GSGLGB2LXXX", "USD", "NS-GS-001"),
+            ("CP-006", "Barclays", "BARCGB22XXX", "GBP", "NS-BARC-001"),
+            ("CP-007", "BNP Paribas", "BNPAFRPPXXX", "EUR", "NS-BNP-001"),
+            ("CP-008", "UBS", "UBSWCHZH80A", "CHF", "NS-UBS-001"),
         ]
 
-        for cp_id, name, lei, _ in counterparties:
+        for cp_id, name, lei, _base_currency, _netting_set_id in counterparties:
             db.add(Counterparty(counterparty_id=cp_id, name=name, lei=lei))
 
         db.flush()
 
-        for cp_id, _, _, base_currency in counterparties:
-            netting_set_id = f"NS-{cp_id}"
-            csa_id = f"CSA-{cp_id}"
+        for cp_id, _name, _lei, base_currency, netting_set_id in counterparties:
+            db.add(
+                NettingSet(
+                    netting_set_id=netting_set_id,
+                    counterparty_id=cp_id,
+                    base_currency=base_currency,
+                )
+            )
+            db.add(
+                CsaAgreement(
+                    csa_id=f"CSA-{netting_set_id}",
+                    netting_set_id=netting_set_id,
+                    threshold_amount=0,
+                    minimum_transfer_amount=0,
+                    margin_frequency="DAILY",
+                    margin_lag_days=1,
+                    collateral_currency=base_currency,
+                )
+            )
 
-            db.add(NettingSet(
-                netting_set_id=netting_set_id,
-                counterparty_id=cp_id,
-                base_currency=base_currency
-            ))
-
-            db.add(CsaAgreement(
-                csa_id=csa_id,
-                netting_set_id=netting_set_id,
-                threshold_amount=0,
-                minimum_transfer_amount=0,
-                margin_frequency="DAILY",
-                margin_lag_days=1,
-                collateral_currency=base_currency
-            ))
-
-        db.add(MarketDataSnapshot(
-            market_data_snapshot_id="MD-001",
-            valuation_date=valuation_date,
-            source_system="MVP-SEED"
-        ))
-
+        db.add(
+            MarketDataSnapshot(
+                market_data_snapshot_id="MD-001",
+                valuation_date=valuation_date,
+                source_system="MVP-SEED",
+            )
+        )
         db.flush()
 
-        discount_curve_defs = [
-            ("USD", "SOFR", 0.86),
-            ("EUR", "EURIBOR", 0.89),
-            ("GBP", "SONIA", 0.87),
-            ("CHF", "SARON", 0.92),
-        ]
+        par_rate_curves = {
+            "USD": {"index": "SOFR", "rates": {"1Y": 4.85, "2Y": 4.62, "3Y": 4.48, "5Y": 4.28, "7Y": 4.22, "10Y": 4.18}},
+            "EUR": {"index": "EURIBOR", "rates": {"1Y": 3.35, "2Y": 3.18, "3Y": 3.05, "5Y": 2.94, "7Y": 2.91, "10Y": 2.88}},
+            "GBP": {"index": "SONIA", "rates": {"1Y": 4.70, "2Y": 4.43, "3Y": 4.31, "5Y": 4.18, "7Y": 4.10, "10Y": 4.02}},
+            "CHF": {"index": "SARON", "rates": {"1Y": 1.38, "2Y": 1.30, "3Y": 1.25, "5Y": 1.20, "7Y": 1.18, "10Y": 1.15}},
+        }
 
-        for currency, floating_index, df in discount_curve_defs:
+        for currency, curve_def in par_rate_curves.items():
             curve_id = f"CURVE-{currency}-DISCOUNT-001"
-
-            db.add(Curve(
-                curve_id=curve_id,
-                market_data_snapshot_id="MD-001",
-                curve_type="DISCOUNT",
-                curve_name=f"{currency} {floating_index} Discount",
-                currency=currency,
-                floating_index=floating_index
-            ))
-
-            db.add(CurvePoint(
-                curve_point_id=f"{curve_id}-5Y",
-                curve_id=curve_id,
-                tenor="5Y",
-                maturity_date=valuation_date + timedelta(days=365 * 5),
-                value=df,
-                value_type="DISCOUNT_FACTOR"
-            ))
+            db.add(
+                Curve(
+                    curve_id=curve_id,
+                    market_data_snapshot_id="MD-001",
+                    curve_type="DISCOUNT",
+                    curve_name=f"{currency} {curve_def['index']} Cube Snap",
+                    currency=currency,
+                    floating_index=curve_def["index"],
+                )
+            )
+            for tenor, rate in curve_def["rates"].items():
+                years = int(tenor.replace("Y", ""))
+                db.add(
+                    CurvePoint(
+                        curve_point_id=f"{curve_id}-{tenor}",
+                        curve_id=curve_id,
+                        tenor=tenor,
+                        maturity_date=valuation_date + timedelta(days=365 * years),
+                        value=rate,
+                        value_type="PAR_RATE_PCT",
+                    )
+                )
 
         credit_spreads = {
             "CP-001": 0.0110,
@@ -127,119 +128,113 @@ def seed_mvp_dataset():
             "CP-008": 0.0095,
         }
 
-        for cp_id, name, _, base_currency in counterparties:
+        for cp_id, name, _lei, base_currency, _netting_set_id in counterparties:
             curve_id = f"CURVE-{cp_id}-CREDIT"
+            db.add(
+                Curve(
+                    curve_id=curve_id,
+                    market_data_snapshot_id="MD-001",
+                    curve_type="CREDIT",
+                    curve_name=f"{name} Credit Curve",
+                    currency=base_currency,
+                    counterparty_id=cp_id,
+                )
+            )
+            db.add(
+                CurvePoint(
+                    curve_point_id=f"{curve_id}-5Y",
+                    curve_id=curve_id,
+                    tenor="5Y",
+                    maturity_date=valuation_date + timedelta(days=365 * 5),
+                    value=credit_spreads[cp_id],
+                    value_type="CREDIT_SPREAD",
+                )
+            )
+            db.add(
+                RecoveryRate(
+                    recovery_rate_id=f"REC-{cp_id}",
+                    counterparty_id=cp_id,
+                    market_data_snapshot_id="MD-001",
+                    recovery_rate=0.4,
+                )
+            )
 
-            db.add(Curve(
-                curve_id=curve_id,
-                market_data_snapshot_id="MD-001",
-                curve_type="CREDIT",
-                curve_name=f"{name} Credit Curve",
-                currency=base_currency,
-                counterparty_id=cp_id
-            ))
-
-            db.add(CurvePoint(
-                curve_point_id=f"{curve_id}-5Y",
-                curve_id=curve_id,
-                tenor="5Y",
-                maturity_date=valuation_date + timedelta(days=365 * 5),
-                value=credit_spreads[cp_id],
-                value_type="CREDIT_SPREAD"
-            ))
-
-            db.add(RecoveryRate(
-                recovery_rate_id=f"REC-{cp_id}",
-                counterparty_id=cp_id,
-                market_data_snapshot_id="MD-001",
-                recovery_rate=0.4
-            ))
+        seed_existing_irs_trades(db, valuation_date)
 
         db.commit()
-        return {"status": "reset_and_seeded"}
-
-    finally:
-        db.close()
-
-
-# ========================================
-# CALCULATE (ONLY CHANGE BELOW)
-# ========================================
-@router.post("/screens/screen1/calculate")
-def calculate_screen1(payload: dict):
-    db = SessionLocal()
-
-    try:
-        counterparty = db.query(Counterparty).filter(
-            Counterparty.counterparty_id == payload["counterparty_id"]
-        ).first()
-
-        netting_set = db.query(NettingSet).filter(
-            NettingSet.counterparty_id == counterparty.counterparty_id
-        ).first()
-
-        csa = db.query(CsaAgreement).filter(
-            CsaAgreement.netting_set_id == netting_set.netting_set_id
-        ).first()
-
-        snapshot = db.query(MarketDataSnapshot).first()
-
-        discount_curve = db.query(Curve).filter(
-            Curve.curve_type == "DISCOUNT"
-        ).first()
-
-        credit_curve = db.query(Curve).filter(
-            Curve.curve_type == "CREDIT"
-        ).first()
-
-        discount_point = db.query(CurvePoint).filter(
-            CurvePoint.curve_id == discount_curve.curve_id
-        ).first()
-
-        credit_point = db.query(CurvePoint).filter(
-            CurvePoint.curve_id == credit_curve.curve_id
-        ).first()
-
-        recovery = db.query(RecoveryRate).first()
-
-        notional = float(payload["notional"])
-        maturity_years = maturity_to_years(payload["maturity"])
-
-        epe = notional * 0.02
-        valuation_date = snapshot.valuation_date
-
-        # ========================
-        # FIXED EXPOSURE PROFILE
-        # ========================
-        run_id = f"RUN-{uuid.uuid4()}"
-        profile = []
-
-        bucket_years = [i / 4 for i in range(1, maturity_years * 4 + 1)]
-
-        for i, year in enumerate(bucket_years):
-
-            progress = year / maturity_years
-            shape_factor = math.sin(progress * math.pi) ** 1.3
-
-            bucket_epe = epe * shape_factor
-            bucket_date = valuation_date + timedelta(days=int(365 * year))
-
-            profile.append({
-                "year": year,
-                "date": str(bucket_date),
-                "epe": round(bucket_epe, 2)
-            })
 
         return {
-            "cva_amount": round(epe, 2),
-            "cs01": round(epe * 0.01, 2),
-            "calculation_run_id": run_id,
-            "exposure_profile": profile,
+            "status": "reset_and_seeded",
+            "totals": {
+                "counterparties": db.query(Counterparty).count(),
+                "netting_sets": db.query(NettingSet).count(),
+                "irs_trades": db.query(IrsTrade).count(),
+                "csas": db.query(CsaAgreement).count(),
+                "curves": db.query(Curve).count(),
+                "curve_points": db.query(CurvePoint).count(),
+                "recovery_rates": db.query(RecoveryRate).count(),
+            },
         }
+
+    except Exception:
+        db.rollback()
+        raise
 
     finally:
         db.close()
 
 
-def maturity_to_years(m):
-    return {"1Y": 1, "2Y": 2, "3Y": 3, "5Y": 5, "10Y": 10}.get(m, 5)
+@router.get("/mvp/summary")
+def get_mvp_summary():
+    db = SessionLocal()
+    try:
+        return {
+            "counterparties": db.query(Counterparty).count(),
+            "netting_sets": db.query(NettingSet).count(),
+            "irs_trades": db.query(IrsTrade).count(),
+            "csas": db.query(CsaAgreement).count(),
+            "curves": db.query(Curve).count(),
+            "curve_points": db.query(CurvePoint).count(),
+            "recovery_rates": db.query(RecoveryRate).count(),
+            "calculation_runs": db.query(CalculationRun).count(),
+            "exposure_profiles": db.query(ExposureProfile).count(),
+            "cva_results": db.query(CvaResult).count(),
+        }
+    finally:
+        db.close()
+
+
+def seed_existing_irs_trades(db, valuation_date: date):
+    trade_specs = [
+        ("DB-IRS-001", 125_000_000, "USD", 0.0470, "SOFR", "PAY", 1),
+        ("DB-IRS-002", 150_000_000, "USD", 0.0462, "SOFR", "RECEIVE", 2),
+        ("DB-IRS-003", 175_000_000, "USD", 0.0450, "SOFR", "PAY", 3),
+        ("DB-IRS-004", 200_000_000, "USD", 0.0428, "SOFR", "RECEIVE", 5),
+        ("DB-IRS-005", 125_000_000, "USD", 0.0422, "SOFR", "PAY", 7),
+        ("DB-IRS-006", 150_000_000, "USD", 0.0418, "SOFR", "RECEIVE", 10),
+        ("DB-IRS-007", 175_000_000, "USD", 0.0435, "SOFR", "PAY", 4),
+        ("DB-IRS-008", 150_000_000, "USD", 0.0440, "SOFR", "PAY", 6),
+        ("DB-IRS-009", 125_000_000, "USD", 0.0415, "SOFR", "RECEIVE", 8),
+        ("DB-IRS-010", 175_000_000, "USD", 0.0425, "SOFR", "PAY", 12),
+        ("DB-IRS-011", 150_000_000, "USD", 0.0455, "SOFR", "RECEIVE", 2),
+        ("DB-IRS-012", 150_000_000, "USD", 0.0448, "SOFR", "PAY", 3),
+        ("DB-IRS-013", 125_000_000, "USD", 0.0430, "SOFR", "RECEIVE", 5),
+        ("DB-IRS-014", 125_000_000, "USD", 0.0421, "SOFR", "PAY", 9),
+    ]
+
+    for index, (external_id, notional, currency, fixed_rate, floating_index, direction, maturity_years) in enumerate(trade_specs, start=1):
+        db.add(
+            IrsTrade(
+                trade_id=f"IRS-DB-{index:03d}",
+                external_trade_id=external_id,
+                netting_set_id="NS-DB-001",
+                notional=notional,
+                currency=currency,
+                trade_date=valuation_date - timedelta(days=90 + index),
+                effective_date=valuation_date - timedelta(days=88 + index),
+                maturity_date=valuation_date + timedelta(days=365 * maturity_years),
+                fixed_rate=fixed_rate,
+                floating_index=floating_index,
+                pay_receive_fixed=direction,
+            )
+        )
