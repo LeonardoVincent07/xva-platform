@@ -367,6 +367,11 @@ def get_cva_risk_summary():
                 portfolio_buckets[label]["cva_contribution"] += cva_contribution
 
             cs01 = abs(cva_total) * 0.0118
+            # MVP DVA proxy: positive own-credit offset against counterparty CVA.
+            # This is deliberately simple for Screen 2 and can be replaced by an
+            # own-credit curve once that data is introduced.
+            dva_total = abs(cva_total) * 0.145
+            net_cva = cva_total + dva_total
             driver = f"Peak EPE at {peak_bucket}" if peak_bucket != "—" else "Trade exposure"
 
             rows.append(
@@ -380,6 +385,8 @@ def get_cva_risk_summary():
                     },
                     "currency": currency,
                     "cva": round(cva_total, 2),
+                    "dva": round(dva_total, 2),
+                    "net_cva": round(net_cva, 2),
                     "cs01": round(cs01, 2),
                     "peak_epe": round(peak_epe, 2),
                     "credit_spread_bps": round(default_spread * 10000, 1),
@@ -419,6 +426,8 @@ def get_cva_risk_summary():
                 )
 
         total_cva = sum(float(row["cva"] or 0) for row in rows)
+        total_dva = sum(float(row.get("dva") or 0) for row in rows)
+        total_net_cva = total_cva + total_dva
         total_cs01 = sum(float(row["cs01"] or 0) for row in rows)
         peak_epe = max([float(bucket["epe"] or 0) for bucket in ordered_buckets] or [0])
         total_trades = sum(int(row["netting_set"]["trade_count"] or 0) for row in rows)
@@ -430,6 +439,8 @@ def get_cva_risk_summary():
             "model_version": "MVP-CVA-RISK-0.1",
             "portfolio": {
                 "cva": round(total_cva, 2),
+                "dva": round(total_dva, 2),
+                "net_cva": round(total_net_cva, 2),
                 "cs01": round(total_cs01, 2),
                 "peak_epe": round(peak_epe, 2),
                 "counterparties": len(rows),
@@ -439,7 +450,7 @@ def get_cva_risk_summary():
             "buckets": ordered_buckets,
             "lineage": {
                 "source_tables": ["counterparties", "netting_sets", "irs_trades", "curves", "curve_points", "recovery_rates"],
-                "method": "Simplified MVP CVA aggregation: exposure x marginal PD x LGD x discount factor",
+                "method": "Simplified MVP CVA aggregation: exposure x marginal PD x LGD x discount factor; DVA is an MVP own-credit offset proxy",
                 "limitations": ["No Monte Carlo engine", "No calibrated PD curve", "No Murex reconciliation yet"],
             },
         }

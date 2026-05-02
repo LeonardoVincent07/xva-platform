@@ -703,9 +703,20 @@ function CvaRiskScreen({ onOpenCounterparty, onOpenBucket, onOpenRun }) {
               <h2 className="font-display text-2xl font-semibold text-white">{filters.counterpartyId === 'ALL' ? 'All Counterparties' : selected?.counterparty?.name || '—'}</h2>
               <p className="mt-1 text-sm text-white/50">CVA is decomposed into exposure, credit spread and LGD so the number feels causal rather than arbitrary.</p>
             </div>
-            <div className="grid min-w-[420px] grid-cols-4 gap-3">
-              <RiskMiniStat label={filters.view} value={filters.view === 'CS01' ? formatCompactCurrency(filteredPortfolio.cs01, activeCurrency) : filters.view === 'EXPOSURE' ? formatCompactCurrency(filteredPortfolio.peak_epe, activeCurrency) : formatCompactCurrency(filteredPortfolio.cva, activeCurrency)} tone="green" />
-              <RiskMiniStat label="Names" value={filteredPortfolio.counterparties ?? '—'} />
+            <div className="grid min-w-[620px] grid-cols-6 gap-3">
+              <RiskMiniStat
+                label="CVA"
+                value={formatCompactCurrency(filteredPortfolio.cva, activeCurrency)}
+              />
+             <RiskMiniStat
+                label="DVA"
+                value={formatCompactCurrency(filteredPortfolio.dva, activeCurrency)}
+              />
+              <RiskMiniStat
+                 label="Net CVA"
+                 value={formatCompactCurrency(filteredPortfolio.net_cva, activeCurrency)}
+              />
+              <RiskMiniStat label="Names" value={filteredPortfolio.counterparties?.length ?? '—'} />
               <RiskMiniStat label="Bucket" value={filters.bucket === 'ALL' ? 'All' : filters.bucket} />
               <RiskMiniStat label="Currency" value={filters.currency === 'ALL' ? 'All' : filters.currency} />
             </div>
