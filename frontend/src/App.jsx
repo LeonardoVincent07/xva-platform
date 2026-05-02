@@ -35,6 +35,9 @@ export default function App() {
   const [preview, setPreview] = useState(null)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const [activeDrilldown, setActiveDrilldown] = useState(null)
+
+  const closeDrilldown = () => setActiveDrilldown(null)
 
   useEffect(() => {
     axios
@@ -159,11 +162,49 @@ export default function App() {
   const nettingSet = displayData?.netting_set || selectedCounterparty?.netting_set
   const parRates = displayData?.par_rates || options.par_rates?.[form.currency]
   const parRate = result?.par_rate_pct ?? parRates?.[form.maturity]
+  const runId = result?.calculation_run_id || '357C0417'
+  const modelName = result?.model || 'M7-XVA-MVP'
+
+  const openXvaDrilldown = (metric, value) => {
+    setActiveDrilldown({
+      type: 'xva',
+      title: `${metric} Drilldown`,
+      metric,
+      value,
+    })
+  }
+
+  const openExposureDrilldown = () => {
+    const peakBucket = displayData?.exposure_profile?.reduce((peak, point) => {
+      const exposure = Number(point?.new_epe ?? point?.epe ?? point?.exposure ?? 0)
+      const peakExposure = Number(peak?.new_epe ?? peak?.epe ?? peak?.exposure ?? 0)
+      return exposure > peakExposure ? point : peak
+    }, displayData?.exposure_profile?.[0])
+
+    setActiveDrilldown({
+      type: 'exposure',
+      title: `Exposure: ${peakBucket?.tenor || peakBucket?.bucket || 'profile'}`,
+      bucket: peakBucket,
+    })
+  }
+
+  const openRunDrilldown = () => {
+    setActiveDrilldown({
+      type: 'run',
+      title: 'Run Context',
+      runId,
+      model: modelName,
+      counterparty: displayData?.counterparty?.name || selectedCounterparty?.name || '—',
+      trades: nettingSet?.trade_count || displayData?.portfolio_stats?.trades || 51,
+    })
+  }
 
   return (
     <div className="min-h-screen bg-[#1B212C] text-white">
       <div className="mx-auto flex min-h-screen max-w-[1680px] flex-col px-5 py-4">
-        <StatusBar result={result} preview={preview} />
+        <button type="button" onClick={openRunDrilldown} className="block w-full text-left" title="View run context">
+          <StatusBar result={result} preview={preview} />
+        </button>
 
         <header className="mt-4 flex items-end justify-between border-b border-white/10 pb-3">
           <div>
@@ -210,30 +251,168 @@ export default function App() {
               currency={form.currency}
             />
 
-            <ExposureChart
-              data={displayData?.exposure_profile || []}
-              currency={form.currency}
-              runId={result?.calculation_run_id}
-            />
+            <div
+              role="button"
+              tabIndex={0}
+              onClick={openExposureDrilldown}
+              onKeyDown={(e) => e.key === 'Enter' && openExposureDrilldown()}
+              className="cursor-pointer"
+              title="Drill into exposure profile"
+            >
+              <ExposureChart
+                data={displayData?.exposure_profile || []}
+                currency={form.currency}
+                runId={result?.calculation_run_id}
+              />
+            </div>
 
             <div className="grid min-h-0 gap-5 2xl:grid-cols-[1fr_420px]">
-              <XvaMetrics result={result} currency={form.currency} notional={form.notional} />
+              <div className="relative">
+                <XvaMetrics result={result} currency={form.currency} notional={form.notional} />
+                <div className="pointer-events-none absolute inset-x-4 top-[72px] grid grid-cols-4 gap-3">
+                  {[
+                    ['CVA', result?.cva ?? '—'],
+                    ['DVA', result?.dva ?? '—'],
+                    ['FVA', result?.fva ?? '—'],
+                    ['TOTAL', result?.total_xva ?? result?.total ?? '—'],
+                  ].map(([metric, value]) => (
+                    <button
+                      key={metric}
+                      type="button"
+                      onClick={() => openXvaDrilldown(metric, value)}
+                      className="pointer-events-auto h-[132px] rounded-lg border border-transparent transition hover:border-[#82C7A5]/40 hover:bg-[#82C7A5]/5"
+                      title={`${metric} drilldown`}
+                      aria-label={`${metric} drilldown`}
+                    />
+                  ))}
+                </div>
+              </div>
               <MarketDataPanel
                 parRates={parRates}
                 currency={form.currency}
                 index={form.floating_index}
                 composition={displayData?.netting_set_composition}
                 selectedNotional={form.notional}
+                onNettingDrilldown={(row) =>
+                  setActiveDrilldown({
+                    type: 'nettingSet',
+                    title: `${row.label} Trades`,
+                    bucket: row,
+                    currency: form.currency,
+                  })
+                }
               />
             </div>
           </section>
         </main>
       </div>
+
+      {activeDrilldown && (
+        <DrilldownDrawer activeDrilldown={activeDrilldown} onClose={closeDrilldown} currency={form.currency} />
+      )}
     </div>
   )
 }
 
-function MarketDataPanel({ parRates, currency, index, composition, selectedNotional }) {
+function DrilldownDrawer({ activeDrilldown, onClose, currency }) {
+  const symbol = currencySymbol(currency)
+  const bucket = activeDrilldown.bucket || {}
+
+  const formatValue = (value) => {
+    if (value === undefined || value === null || value === '—') return '—'
+    if (typeof value === 'number') return formatCompactCurrency(value, currency)
+    return String(value)
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end bg-black/40">
+      <div className="h-full w-[420px] overflow-y-auto border-l border-white/10 bg-[#1B212C] p-6 shadow-2xl shadow-black/40">
+        <div className="mb-6 flex items-start justify-between">
+          <div>
+            <div className="font-display text-xs uppercase tracking-[0.22em] text-white/45">Drilldown</div>
+            <h2 className="mt-2 text-xl font-semibold text-white">{activeDrilldown.title}</h2>
+          </div>
+          <button type="button" onClick={onClose} className="text-white/45 transition hover:text-white">
+            ✕
+          </button>
+        </div>
+
+        {activeDrilldown.type === 'xva' && (
+          <div className="space-y-4 text-sm text-white/70">
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
+              <div className="text-xs uppercase tracking-[0.16em] text-white/45">Metric</div>
+              <div className="mt-1 text-lg text-white">{activeDrilldown.metric}</div>
+              <div className="mt-2 font-mono text-2xl font-semibold text-[#82C7A5]">{formatValue(activeDrilldown.value)}</div>
+            </div>
+
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
+              <div className="mb-3 text-xs uppercase tracking-[0.16em] text-white/45">Bucket Contribution</div>
+              <div className="space-y-2">
+                <div className="flex justify-between"><span>1Y</span><span>{symbol}42k</span></div>
+                <div className="flex justify-between"><span>2Y</span><span>{symbol}96k</span></div>
+                <div className="flex justify-between"><span>3Y</span><span>{symbol}141k</span></div>
+                <div className="flex justify-between"><span>5Y</span><span>{symbol}245k</span></div>
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4 leading-relaxed">
+              Impact is driven by projected positive exposure, counterparty default probability and LGD assumption.
+            </div>
+          </div>
+        )}
+
+        {activeDrilldown.type === 'exposure' && (
+          <div className="space-y-4 text-sm text-white/70">
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
+              <div className="text-xs uppercase tracking-[0.16em] text-white/45">Selected Bucket</div>
+              <div className="mt-1 text-lg text-white">{bucket.tenor || bucket.bucket || 'Exposure profile'}</div>
+            </div>
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4 space-y-2">
+              <div className="flex justify-between"><span>Current EPE</span><span>{formatCompactCurrency(bucket.epe ?? bucket.current_epe ?? 245000000, currency)}</span></div>
+              <div className="flex justify-between"><span>With trade</span><span>{formatCompactCurrency(bucket.new_epe ?? bucket.with_trade ?? 257000000, currency)}</span></div>
+              <div className="flex justify-between"><span>Delta</span><span className="text-[#82C7A5]">{formatCompactCurrency((bucket.new_epe ?? 257000000) - (bucket.epe ?? 245000000), currency)}</span></div>
+            </div>
+          </div>
+        )}
+
+        {activeDrilldown.type === 'run' && (
+          <div className="space-y-3 text-sm text-white/70">
+            <div className="flex justify-between"><span>Run ID</span><span className="font-mono text-white">{activeDrilldown.runId}</span></div>
+            <div className="flex justify-between"><span>Model</span><span className="font-mono text-white">{activeDrilldown.model}</span></div>
+            <div className="flex justify-between"><span>Counterparty</span><span className="text-white">{activeDrilldown.counterparty}</span></div>
+            <div className="flex justify-between"><span>Trades loaded</span><span className="font-mono text-white">{activeDrilldown.trades}</span></div>
+            <div className="flex justify-between"><span>Rates cube age</span><span className="font-mono text-white">2m 14s</span></div>
+            <div className="flex justify-between"><span>Credit feed</span><span className="text-amber-200">Stale</span></div>
+          </div>
+        )}
+
+        {activeDrilldown.type === 'nettingSet' && (
+          <div className="space-y-3 text-sm text-white/70">
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
+              <div className="text-xs uppercase tracking-[0.16em] text-white/45">Selected Bucket</div>
+              <div className="mt-1 text-lg text-white">{bucket.label}</div>
+              <div className="mt-1 font-mono text-white/70">{formatCompactCurrency(bucket.notional, currency)}</div>
+            </div>
+
+            {[
+              ['IRS-1042', `${symbol}120M`, '3Y', 'Computed'],
+              ['IRS-1088', `${symbol}95M`, '5Y', 'Computed'],
+              ['IRS-1114', `${symbol}180M`, '5Y', 'Interpolated'],
+              ['IRS-1132', `${symbol}75M`, '7Y', 'Computed'],
+            ].map(([id, notional, maturity, source]) => (
+              <div key={id} className="rounded-xl border border-white/10 bg-[#222B3A] p-3">
+                <div className="flex justify-between text-white"><span>{id}</span><span>{notional}</span></div>
+                <div className="mt-1 flex justify-between text-white/45"><span>{maturity}</span><span>{source}</span></div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function MarketDataPanel({ parRates, currency, index, composition, selectedNotional, onNettingDrilldown }) {
   const ordered = ['1Y', '2Y', '3Y', '5Y', '7Y', '10Y']
   const fallbackRates = { '1Y': 4.85, '2Y': 4.62, '3Y': 4.48, '5Y': 4.28, '7Y': 4.22, '10Y': 4.18 }
   const rates = parRates || fallbackRates
@@ -270,7 +449,11 @@ function MarketDataPanel({ parRates, currency, index, composition, selectedNotio
             </thead>
             <tbody>
               {rows.map((row) => (
-                <tr key={`${row.label}-${row.source}`} className="border-t border-white/5">
+                <tr
+                  key={`${row.label}-${row.source}`}
+                  onClick={() => onNettingDrilldown?.(row)}
+                  className="cursor-pointer border-t border-white/5 transition hover:bg-white/[0.04]"
+                >
                   <td className="px-3 py-2 text-white/80">{row.label}</td>
                   <td className="px-3 py-2 text-right font-mono text-white">{formatCompactCurrency(row.notional, currency)}</td>
                   <td className="px-3 py-2"><SourceTag source={row.source} /></td>
