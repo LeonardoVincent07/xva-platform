@@ -271,10 +271,10 @@ export default function App() {
                 <XvaMetrics result={result} currency={form.currency} notional={form.notional} />
                 <div className="pointer-events-none absolute inset-x-4 top-[72px] grid grid-cols-4 gap-3">
                   {[
-                    ['CVA', result?.cva ?? '—'],
-                    ['DVA', result?.dva ?? '—'],
-                    ['FVA', result?.fva ?? '—'],
-                    ['TOTAL', result?.total_xva ?? result?.total ?? '—'],
+                    ['CVA', result?.cva_incremental ?? '—'],
+                    ['DVA', result?.dva_incremental ?? '—'],
+                    ['FVA', result?.fva_incremental ?? '—'],
+                    ['TOTAL', result?.total_xva_charge ?? '—'],
                   ].map(([metric, value]) => (
                     <button
                       key={metric}
