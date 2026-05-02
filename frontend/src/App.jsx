@@ -1138,9 +1138,14 @@ function CvaRiskScreen({ onOpenCounterparty, onOpenBucket, onOpenRun }) {
       trades: trades || summary?.portfolio?.trades,
     }
   }, [filteredRows, allRows, summary])
-  
 
-
+  const handleFilterChange = (key, value) => {
+    setFilters((prev) => ({
+      ...prev,
+      [key]: value,
+      ...(key === 'counterpartyId' ? { bucket: 'ALL' } : {}),
+    }))
+  }
 
   if (loading) {
     return <main className="mt-5 flex flex-1 items-center justify-center rounded-xl border border-white/10 bg-[#222B3A] text-white/60">Loading CVA risk from backend…</main>
@@ -1237,7 +1242,7 @@ function CvaRiskScreen({ onOpenCounterparty, onOpenBucket, onOpenRun }) {
                  label="Net CVA"
                  value={formatCompactCurrency(filteredPortfolio.net_cva, activeCurrency)}
               />
-              <RiskMiniStat label="Names" value={filteredPortfolio.counterparties?.length ?? '—'} />
+              <RiskMiniStat label="Names" value={filteredPortfolio.counterparties ?? '—'} />
               <RiskMiniStat label="Bucket" value={filters.bucket === 'ALL' ? 'All' : filters.bucket} />
               <RiskMiniStat label="Currency" value={filters.currency === 'ALL' ? 'All' : filters.currency} />
             </div>
