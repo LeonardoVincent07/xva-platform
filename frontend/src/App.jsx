@@ -605,9 +605,9 @@ function CvaRiskScreen({ onOpenCounterparty, onOpenBucket, onOpenRun }) {
   const filteredPortfolio = useMemo(() => {
     const rows = filteredRows.length ? filteredRows : allRows
 
-    const cva = rows.reduce((total, row) => total + Math.abs(Number(row.cva || 0)), 0)
-    const dva = rows.reduce((total, row) => total + Math.abs(Number(row.dva || 0)), 0)
-    const netCva = rows.reduce((total, row) => total + Math.abs(Number(row.net_cva || 0)), 0)
+    const cva = rows.reduce((total, row) => total + Number(row.cva || 0), 0)
+    const dva = rows.reduce((total, row) => total + Number(row.dva || 0), 0)
+    const netCva = rows.reduce((total, row) => total + Number(row.net_cva || 0), 0)
     const cs01 = rows.reduce((total, row) => total + Math.abs(Number(row.cs01 || 0)), 0)
     const peakEpe = Math.max(...rows.map((row) => Number(row.peak_epe || 0)), 0)
     const trades = rows.reduce((total, row) => total + Number(row.netting_set?.trade_count || 0), 0)
