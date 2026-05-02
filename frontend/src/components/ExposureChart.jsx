@@ -6,12 +6,17 @@ export default function ExposureChart({ data, currency, runId }) {
       <div className="mb-3 flex items-start justify-between gap-4">
         <div>
           <h2 className="font-display text-xs font-semibold uppercase tracking-[0.16em] text-white/80">Exposure Profile</h2>
-          <p className="mt-1 text-xs text-white/45">Current EPE vs proposed trade overlay and 95% PFE</p>
+          <p className="mt-1 text-xs text-white/45">Path-based EPE and PFE derived from simulated exposure distribution</p>
         </div>
-        <div className="grid grid-cols-3 gap-2 text-right font-mono text-[11px] text-white/55">
-          <MiniStat label="Peak Δ" value={formatMillions(summary.peakDelta, currency)} accent />
-          <MiniStat label="Peak EPE" value={formatMillions(summary.peakNew, currency)} />
-          <MiniStat label="Cube" value={runId ? shortRunId(runId) : 'PREVIEW'} />
+        <div className="flex flex-col items-end gap-2">
+          <div className="rounded-md border border-[#82C7A5]/25 bg-[#82C7A5]/10 px-3 py-1 font-mono text-[10px] uppercase tracking-[0.14em] text-[#82C7A5]">
+            Model: Path-based simulation (250 paths)
+          </div>
+          <div className="grid grid-cols-3 gap-2 text-right font-mono text-[11px] text-white/55">
+            <MiniStat label="Peak Δ" value={formatMillions(summary.peakDelta, currency)} accent />
+            <MiniStat label="Peak EPE" value={formatMillions(summary.peakNew, currency)} />
+            <MiniStat label="Cube" value={runId ? shortRunId(runId) : 'PREVIEW'} />
+          </div>
         </div>
       </div>
 
