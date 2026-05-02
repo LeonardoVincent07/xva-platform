@@ -272,6 +272,181 @@ def calculate_from_screen1(request: Screen1Request):
         db.close()
 
 
+
+@router.get("/cva-risk/summary")
+def get_cva_risk_summary():
+    db = SessionLocal()
+    try:
+        snapshot = db.query(MarketDataSnapshot).order_by(MarketDataSnapshot.valuation_date.desc()).first()
+        if not snapshot:
+            raise HTTPException(status_code=404, detail="Market data snapshot not found. Run /mvp/seed first.")
+
+        counterparties = db.query(Counterparty).order_by(Counterparty.name).all()
+        if not counterparties:
+            raise HTTPException(status_code=404, detail="Counterparties not found. Run /mvp/seed first.")
+
+        rows = []
+        portfolio_buckets = {}
+
+        for counterparty in counterparties:
+            netting_set = db.query(NettingSet).filter(NettingSet.counterparty_id == counterparty.counterparty_id).first()
+            if not netting_set:
+                continue
+
+            trades = get_existing_trades(db, netting_set.netting_set_id)
+            currency = netting_set.base_currency
+            profile = build_portfolio_profile(snapshot.valuation_date, trades, currency)
+
+            credit_curve = db.query(Curve).filter(
+                Curve.market_data_snapshot_id == snapshot.market_data_snapshot_id,
+                Curve.curve_type == "CREDIT",
+                Curve.counterparty_id == counterparty.counterparty_id,
+            ).first()
+
+            credit_points = []
+            if credit_curve:
+                credit_points = db.query(CurvePoint).filter(CurvePoint.curve_id == credit_curve.curve_id).all()
+
+            recovery = db.query(RecoveryRate).filter(
+                RecoveryRate.counterparty_id == counterparty.counterparty_id,
+                RecoveryRate.market_data_snapshot_id == snapshot.market_data_snapshot_id,
+            ).first()
+
+            spread_by_tenor = {p.tenor: float(p.value or 0) for p in credit_points}
+            default_spread = spread_by_tenor.get("5Y") or (sum(spread_by_tenor.values()) / len(spread_by_tenor) if spread_by_tenor else 0.0125)
+            recovery_rate = float(recovery.recovery_rate) if recovery else 0.40
+            lgd = 1.0 - recovery_rate
+
+            cva_total = 0.0
+            exposure_profile = []
+            peak_epe = 0.0
+            peak_bucket = "—"
+
+            for point in profile:
+                label = point["label"]
+                spread = spread_by_tenor.get(label) or default_spread
+                epe = float(point["epe_current"] or 0)
+                pfe = float(point["pfe_95"] or 0)
+                year = float(point["year"] or 0)
+                marginal_pd = min(spread * max(year, 0.08), 0.45)
+                discount_factor = 1 / ((1 + 0.035) ** max(year, 0.08))
+                cva_contribution = -abs(epe * marginal_pd * lgd * discount_factor * 0.18)
+
+                cva_total += cva_contribution
+                if epe > peak_epe:
+                    peak_epe = epe
+                    peak_bucket = label
+
+                bucket_payload = {
+                    "label": label,
+                    "date": point["date"],
+                    "year": year,
+                    "epe": round(epe, 2),
+                    "pfe_95": round(pfe, 2),
+                    "credit_spread_bps": round(spread * 10000, 1),
+                    "marginal_pd": round(marginal_pd, 6),
+                    "recovery_rate": round(recovery_rate, 4),
+                    "lgd": round(lgd, 4),
+                    "discount_factor": round(discount_factor, 6),
+                    "cva_contribution": round(cva_contribution, 2),
+                    "driver": "Exposure" if epe >= peak_epe else "Credit / LGD",
+                }
+                exposure_profile.append(bucket_payload)
+
+                if label not in portfolio_buckets:
+                    portfolio_buckets[label] = {
+                        "label": label,
+                        "date": point["date"],
+                        "year": year,
+                        "epe": 0.0,
+                        "pfe_95": 0.0,
+                        "cva_contribution": 0.0,
+                    }
+                portfolio_buckets[label]["epe"] += epe
+                portfolio_buckets[label]["pfe_95"] += pfe
+                portfolio_buckets[label]["cva_contribution"] += cva_contribution
+
+            cs01 = abs(cva_total) * 0.0118
+            driver = f"Peak EPE at {peak_bucket}" if peak_bucket != "—" else "Trade exposure"
+
+            rows.append(
+                {
+                    "counterparty": {"id": counterparty.counterparty_id, "name": counterparty.name},
+                    "netting_set": {
+                        "id": netting_set.netting_set_id,
+                        "base_currency": netting_set.base_currency,
+                        "trade_count": len(trades),
+                        "notional": round(sum(float(t.notional or 0) for t in trades), 2),
+                    },
+                    "currency": currency,
+                    "cva": round(cva_total, 2),
+                    "cs01": round(cs01, 2),
+                    "peak_epe": round(peak_epe, 2),
+                    "credit_spread_bps": round(default_spread * 10000, 1),
+                    "recovery_rate": round(recovery_rate, 4),
+                    "lgd": round(lgd, 4),
+                    "driver": driver,
+                    "exposure_profile": exposure_profile,
+                    "trades": [
+                        {
+                            "trade_id": t.trade_id,
+                            "external_trade_id": t.external_trade_id,
+                            "product": "IRS",
+                            "currency": t.currency,
+                            "notional": round(float(t.notional or 0), 2),
+                            "maturity": maturity_label(t.effective_date, t.maturity_date),
+                            "fixed_rate": round(float(t.fixed_rate or 0) * 100, 4),
+                            "floating_index": t.floating_index,
+                            "direction": t.pay_receive_fixed,
+                        }
+                        for t in trades[:12]
+                    ],
+                }
+            )
+
+        ordered_buckets = []
+        for label, _year in profile_buckets():
+            bucket = portfolio_buckets.get(label)
+            if bucket:
+                ordered_buckets.append(
+                    {
+                        **bucket,
+                        "epe": round(bucket["epe"], 2),
+                        "pfe_95": round(bucket["pfe_95"], 2),
+                        "cva_contribution": round(bucket["cva_contribution"], 2),
+                        "driver": "Aggregated portfolio exposure",
+                    }
+                )
+
+        total_cva = sum(float(row["cva"] or 0) for row in rows)
+        total_cs01 = sum(float(row["cs01"] or 0) for row in rows)
+        peak_epe = max([float(bucket["epe"] or 0) for bucket in ordered_buckets] or [0])
+        total_trades = sum(int(row["netting_set"]["trade_count"] or 0) for row in rows)
+
+        return {
+            "status": "LIVE",
+            "calculation_run_id": "CVA-RISK-LIVE-VIEW",
+            "valuation_date": str(snapshot.valuation_date),
+            "model_version": "MVP-CVA-RISK-0.1",
+            "portfolio": {
+                "cva": round(total_cva, 2),
+                "cs01": round(total_cs01, 2),
+                "peak_epe": round(peak_epe, 2),
+                "counterparties": len(rows),
+                "trades": total_trades,
+            },
+            "counterparties": rows,
+            "buckets": ordered_buckets,
+            "lineage": {
+                "source_tables": ["counterparties", "netting_sets", "irs_trades", "curves", "curve_points", "recovery_rates"],
+                "method": "Simplified MVP CVA aggregation: exposure x marginal PD x LGD x discount factor",
+                "limitations": ["No Monte Carlo engine", "No calibrated PD curve", "No Murex reconciliation yet"],
+            },
+        }
+    finally:
+        db.close()
+
+
 def get_counterparty_context(db, counterparty_id: str):
     counterparty = db.query(Counterparty).filter(Counterparty.counterparty_id == counterparty_id).first()
     if not counterparty:

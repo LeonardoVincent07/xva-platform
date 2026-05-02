@@ -162,6 +162,51 @@ def get_screen1_context(counterparty_id: str, currency: str | None = None):
         db.close()
 
 
+@router.get("/screen1/netting-set/{counterparty_id}/trades")
+def get_screen1_netting_set_trades(counterparty_id: str):
+    db = SessionLocal()
+    try:
+        counterparty, netting_set, _snapshot = get_counterparty_context(db, counterparty_id)
+        trades = (
+            db.query(IrsTrade)
+            .filter(IrsTrade.netting_set_id == netting_set.netting_set_id)
+            .order_by(IrsTrade.maturity_date.asc(), IrsTrade.trade_id.asc())
+            .all()
+        )
+
+        return {
+            "counterparty": {
+                "id": counterparty.counterparty_id,
+                "name": counterparty.name,
+            },
+            "netting_set": {
+                "id": netting_set.netting_set_id,
+                "base_currency": netting_set.base_currency,
+                "trade_count": len(trades),
+                "notional": round(sum(float(t.notional or 0) for t in trades), 2),
+            },
+            "trades": [
+                {
+                    "trade_id": t.trade_id,
+                    "external_trade_id": t.external_trade_id,
+                    "product": "IRS",
+                    "currency": t.currency,
+                    "notional": round(float(t.notional or 0), 2),
+                    "trade_date": str(t.trade_date),
+                    "effective_date": str(t.effective_date),
+                    "maturity_date": str(t.maturity_date),
+                    "maturity": maturity_label(t.effective_date, t.maturity_date),
+                    "fixed_rate": round(float(t.fixed_rate or 0) * 100, 4),
+                    "floating_index": t.floating_index,
+                    "direction": t.pay_receive_fixed,
+                }
+                for t in trades
+            ],
+        }
+    finally:
+        db.close()
+
+
 @router.post("/screen1/calculate")
 def calculate_from_screen1(request: Screen1Request):
     db = SessionLocal()
@@ -504,10 +549,16 @@ def normalise_rate_to_pct(rate: float) -> float:
     return rate * 100 if rate < 1 else rate
 
 
+def maturity_label(effective_date: date, maturity_date: date) -> str:
+    years = max(1, round((maturity_date - effective_date).days / 365))
+    return f"{years}Y"
+
+
 def to_bps(amount: float, notional: float) -> float:
     if notional == 0:
         return 0
     return amount / notional * 10000
+
 
 
 ====================================================================================================
@@ -5231,10 +5282,10 @@ export default function App() {
                 <XvaMetrics result={result} currency={form.currency} notional={form.notional} />
                 <div className="pointer-events-none absolute inset-x-4 top-[72px] grid grid-cols-4 gap-3">
                   {[
-                    ['CVA', result?.cva ?? '—'],
-                    ['DVA', result?.dva ?? '—'],
-                    ['FVA', result?.fva ?? '—'],
-                    ['TOTAL', result?.total_xva ?? result?.total ?? '—'],
+                    ['CVA', result?.cva_incremental ?? '—'],
+                    ['DVA', result?.dva_incremental ?? '—'],
+                    ['FVA', result?.fva_incremental ?? '—'],
+                    ['TOTAL', result?.total_xva_charge ?? '—'],
                   ].map(([metric, value]) => (
                     <button
                       key={metric}
@@ -5259,6 +5310,7 @@ export default function App() {
                     title: `${row.label} Trades`,
                     bucket: row,
                     currency: form.currency,
+                    counterpartyId: form.counterparty_id,
                   })
                 }
               />
@@ -5277,6 +5329,25 @@ export default function App() {
 function DrilldownDrawer({ activeDrilldown, onClose, currency }) {
   const symbol = currencySymbol(currency)
   const bucket = activeDrilldown.bucket || {}
+  const [tradeDrilldown, setTradeDrilldown] = useState({ loading: false, error: '', trades: [] })
+
+  useEffect(() => {
+    if (activeDrilldown.type !== 'nettingSet' || !activeDrilldown.counterpartyId) {
+      setTradeDrilldown({ loading: false, error: '', trades: [] })
+      return
+    }
+
+    setTradeDrilldown({ loading: true, error: '', trades: [] })
+
+    axios
+      .get(`${API_BASE}/screens/screen1/netting-set/${activeDrilldown.counterpartyId}/trades`)
+      .then((res) => {
+        setTradeDrilldown({ loading: false, error: '', trades: res.data?.trades || [] })
+      })
+      .catch((err) => {
+        setTradeDrilldown({ loading: false, error: err.response?.data?.detail || err.message, trades: [] })
+      })
+  }, [activeDrilldown.type, activeDrilldown.counterpartyId])
 
   const formatValue = (value) => {
     if (value === undefined || value === null || value === '—') return '—'
@@ -5354,15 +5425,38 @@ function DrilldownDrawer({ activeDrilldown, onClose, currency }) {
               <div className="mt-1 font-mono text-white/70">{formatCompactCurrency(bucket.notional, currency)}</div>
             </div>
 
-            {[
-              ['IRS-1042', `${symbol}120M`, '3Y', 'Computed'],
-              ['IRS-1088', `${symbol}95M`, '5Y', 'Computed'],
-              ['IRS-1114', `${symbol}180M`, '5Y', 'Interpolated'],
-              ['IRS-1132', `${symbol}75M`, '7Y', 'Computed'],
-            ].map(([id, notional, maturity, source]) => (
-              <div key={id} className="rounded-xl border border-white/10 bg-[#222B3A] p-3">
-                <div className="flex justify-between text-white"><span>{id}</span><span>{notional}</span></div>
-                <div className="mt-1 flex justify-between text-white/45"><span>{maturity}</span><span>{source}</span></div>
+            {tradeDrilldown.loading && (
+              <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4 text-white/60">
+                Loading trades from database…
+              </div>
+            )}
+
+            {tradeDrilldown.error && (
+              <div className="rounded-xl border border-red-400/30 bg-red-500/10 p-4 text-red-200">
+                {tradeDrilldown.error}
+              </div>
+            )}
+
+            {!tradeDrilldown.loading && !tradeDrilldown.error && tradeDrilldown.trades.length === 0 && (
+              <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4 text-white/60">
+                No trades found for this netting set.
+              </div>
+            )}
+
+            {!tradeDrilldown.loading && !tradeDrilldown.error && tradeDrilldown.trades.slice(0, activeDrilldown?.title === "2 added today Trades" ? 2 : undefined).map((trade) => (
+              <div key={trade.trade_id} className="rounded-xl border border-white/10 bg-[#222B3A] p-3">
+                <div className="flex justify-between gap-4 text-white">
+                  <span>{trade.external_trade_id || trade.trade_id}</span>
+                  <span>{formatCompactCurrency(trade.notional, trade.currency || currency)}</span>
+                </div>
+                <div className="mt-1 flex justify-between text-white/45">
+                  <span>{trade.product} · {trade.direction} · {trade.fixed_rate}%</span>
+                  <span>{trade.maturity}</span>
+                </div>
+                <div className="mt-1 flex justify-between text-white/35">
+                  <span>{trade.floating_index}</span>
+                  <span>{trade.maturity_date}</span>
+                </div>
               </div>
             ))}
           </div>
