@@ -352,6 +352,192 @@ def calculate_from_screen1(request: Screen1Request):
         db.close()
 
 
+
+@router.get("/cva-risk/summary")
+def get_cva_risk_summary():
+    db = SessionLocal()
+    try:
+        snapshot = db.query(MarketDataSnapshot).order_by(MarketDataSnapshot.valuation_date.desc()).first()
+        if not snapshot:
+            raise HTTPException(status_code=404, detail="Market data snapshot not found. Run /mvp/seed first.")
+
+        counterparties = db.query(Counterparty).order_by(Counterparty.name).all()
+        if not counterparties:
+            raise HTTPException(status_code=404, detail="Counterparties not found. Run /mvp/seed first.")
+
+        rows = []
+        portfolio_buckets = {}
+
+        for counterparty in counterparties:
+            netting_set = db.query(NettingSet).filter(NettingSet.counterparty_id == counterparty.counterparty_id).first()
+            if not netting_set:
+                continue
+
+            trades = get_existing_trades(db, netting_set.netting_set_id)
+            currency = netting_set.base_currency
+            profile = build_portfolio_profile(snapshot.valuation_date, trades, currency)
+
+            credit_curve = db.query(Curve).filter(
+                Curve.market_data_snapshot_id == snapshot.market_data_snapshot_id,
+                Curve.curve_type == "CREDIT",
+                Curve.counterparty_id == counterparty.counterparty_id,
+            ).first()
+
+            credit_points = []
+            if credit_curve:
+                credit_points = db.query(CurvePoint).filter(CurvePoint.curve_id == credit_curve.curve_id).all()
+
+            recovery = db.query(RecoveryRate).filter(
+                RecoveryRate.counterparty_id == counterparty.counterparty_id,
+                RecoveryRate.market_data_snapshot_id == snapshot.market_data_snapshot_id,
+            ).first()
+
+            spread_by_tenor = {p.tenor: float(p.value or 0) for p in credit_points}
+            default_spread = spread_by_tenor.get("5Y") or (sum(spread_by_tenor.values()) / len(spread_by_tenor) if spread_by_tenor else 0.0125)
+            recovery_rate = float(recovery.recovery_rate) if recovery else 0.40
+            lgd = 1.0 - recovery_rate
+
+            cva_total = 0.0
+            exposure_profile = []
+            peak_epe = 0.0
+            peak_bucket = "—"
+
+            for point in profile:
+                label = point["label"]
+                spread = spread_by_tenor.get(label) or default_spread
+                epe = float(point["epe_current"] or 0)
+                pfe = float(point["pfe_95"] or 0)
+                year = float(point["year"] or 0)
+                marginal_pd = min(spread * max(year, 0.08), 0.45)
+                discount_factor = 1 / ((1 + 0.035) ** max(year, 0.08))
+                cva_contribution = -abs(epe * marginal_pd * lgd * discount_factor * 0.18)
+
+                cva_total += cva_contribution
+                if epe > peak_epe:
+                    peak_epe = epe
+                    peak_bucket = label
+
+                bucket_payload = {
+                    "label": label,
+                    "date": point["date"],
+                    "year": year,
+                    "epe": round(epe, 2),
+                    "pfe_95": round(pfe, 2),
+                    "credit_spread_bps": round(spread * 10000, 1),
+                    "marginal_pd": round(marginal_pd, 6),
+                    "recovery_rate": round(recovery_rate, 4),
+                    "lgd": round(lgd, 4),
+                    "discount_factor": round(discount_factor, 6),
+                    "cva_contribution": round(cva_contribution, 2),
+                    "driver": "Exposure" if epe >= peak_epe else "Credit / LGD",
+                }
+                exposure_profile.append(bucket_payload)
+
+                if label not in portfolio_buckets:
+                    portfolio_buckets[label] = {
+                        "label": label,
+                        "date": point["date"],
+                        "year": year,
+                        "epe": 0.0,
+                        "pfe_95": 0.0,
+                        "cva_contribution": 0.0,
+                    }
+                portfolio_buckets[label]["epe"] += epe
+                portfolio_buckets[label]["pfe_95"] += pfe
+                portfolio_buckets[label]["cva_contribution"] += cva_contribution
+
+            cs01 = abs(cva_total) * 0.0118
+            # MVP DVA proxy: positive own-credit offset against counterparty CVA.
+            # This is deliberately simple for Screen 2 and can be replaced by an
+            # own-credit curve once that data is introduced.
+            dva_total = abs(cva_total) * 0.145
+            net_cva = cva_total + dva_total
+            driver = f"Peak EPE at {peak_bucket}" if peak_bucket != "—" else "Trade exposure"
+
+            rows.append(
+                {
+                    "counterparty": {"id": counterparty.counterparty_id, "name": counterparty.name},
+                    "netting_set": {
+                        "id": netting_set.netting_set_id,
+                        "base_currency": netting_set.base_currency,
+                        "trade_count": len(trades),
+                        "notional": round(sum(float(t.notional or 0) for t in trades), 2),
+                    },
+                    "currency": currency,
+                    "cva": round(cva_total, 2),
+                    "dva": round(dva_total, 2),
+                    "net_cva": round(net_cva, 2),
+                    "cs01": round(cs01, 2),
+                    "peak_epe": round(peak_epe, 2),
+                    "credit_spread_bps": round(default_spread * 10000, 1),
+                    "recovery_rate": round(recovery_rate, 4),
+                    "lgd": round(lgd, 4),
+                    "driver": driver,
+                    "exposure_profile": exposure_profile,
+                    "trades": [
+                        {
+                            "trade_id": t.trade_id,
+                            "external_trade_id": t.external_trade_id,
+                            "product": "IRS",
+                            "currency": t.currency,
+                            "notional": round(float(t.notional or 0), 2),
+                            "maturity": maturity_label(t.effective_date, t.maturity_date),
+                            "fixed_rate": round(float(t.fixed_rate or 0) * 100, 4),
+                            "floating_index": t.floating_index,
+                            "direction": t.pay_receive_fixed,
+                        }
+                        for t in trades[:12]
+                    ],
+                }
+            )
+
+        ordered_buckets = []
+        for label, _year in profile_buckets():
+            bucket = portfolio_buckets.get(label)
+            if bucket:
+                ordered_buckets.append(
+                    {
+                        **bucket,
+                        "epe": round(bucket["epe"], 2),
+                        "pfe_95": round(bucket["pfe_95"], 2),
+                        "cva_contribution": round(bucket["cva_contribution"], 2),
+                        "driver": "Aggregated portfolio exposure",
+                    }
+                )
+
+        total_cva = sum(float(row["cva"] or 0) for row in rows)
+        total_dva = sum(float(row.get("dva") or 0) for row in rows)
+        total_net_cva = total_cva + total_dva
+        total_cs01 = sum(float(row["cs01"] or 0) for row in rows)
+        peak_epe = max([float(bucket["epe"] or 0) for bucket in ordered_buckets] or [0])
+        total_trades = sum(int(row["netting_set"]["trade_count"] or 0) for row in rows)
+
+        return {
+            "status": "LIVE",
+            "calculation_run_id": "CVA-RISK-LIVE-VIEW",
+            "valuation_date": str(snapshot.valuation_date),
+            "model_version": "MVP-CVA-RISK-0.1",
+            "portfolio": {
+                "cva": round(total_cva, 2),
+                "dva": round(total_dva, 2),
+                "net_cva": round(total_net_cva, 2),
+                "cs01": round(total_cs01, 2),
+                "peak_epe": round(peak_epe, 2),
+                "counterparties": len(rows),
+                "trades": total_trades,
+            },
+            "counterparties": rows,
+            "buckets": ordered_buckets,
+            "lineage": {
+                "source_tables": ["counterparties", "netting_sets", "irs_trades", "curves", "curve_points", "recovery_rates"],
+                "method": "Simplified MVP CVA aggregation: exposure x marginal PD x LGD x discount factor; DVA is an MVP own-credit offset proxy",
+                "limitations": ["No Monte Carlo engine", "No calibrated PD curve", "No Murex reconciliation yet"],
+            },
+        }
+    finally:
+        db.close()
+
+
 def get_counterparty_context(db, counterparty_id: str):
     counterparty = db.query(Counterparty).filter(Counterparty.counterparty_id == counterparty_id).first()
     if not counterparty:
@@ -5047,6 +5233,7 @@ export default function App() {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const [activeDrilldown, setActiveDrilldown] = useState(null)
+  const [activeScreen, setActiveScreen] = useState('trader')
 
   const closeDrilldown = () => setActiveDrilldown(null)
 
@@ -5223,13 +5410,13 @@ export default function App() {
               M7 XVA
             </h1>
             <p className="mt-1 text-xs uppercase tracking-[0.24em] text-white/55">
-              New Trade — Incremental XVA
+              {activeScreen === 'trader' ? 'New Trade — Incremental XVA' : 'CVA Risk — Exposure, Credit and LGD'}
             </p>
           </div>
 
           <nav className="hidden gap-8 text-sm text-white/60 lg:flex">
-            <span className="border-b-2 border-[#0145AC] pb-3 text-white">Trader</span>
-            <span className="pb-3">CVA Risk</span>
+            <button type="button" onClick={() => setActiveScreen('trader')} className={`pb-3 ${activeScreen === 'trader' ? 'border-b-2 border-[#0145AC] text-white' : 'text-white/60'}`}>Trader</button>
+            <button type="button" onClick={() => setActiveScreen('cvaRisk')} className={`pb-3 ${activeScreen === 'cvaRisk' ? 'border-b-2 border-[#0145AC] text-white' : 'text-white/60'}`}>CVA Risk</button>
             <span className="pb-3">Desk Head</span>
             <span className="pb-3">Ops / Quant</span>
           </nav>
@@ -5241,7 +5428,8 @@ export default function App() {
           </div>
         )}
 
-        <main className="mt-5 grid flex-1 grid-cols-1 gap-5 xl:grid-cols-[420px_minmax(0,1fr)]">
+        {activeScreen === 'trader' ? (
+          <main className="mt-5 grid flex-1 grid-cols-1 gap-5 xl:grid-cols-[420px_minmax(0,1fr)]">
           <TradeInputPanel
             form={form}
             options={options}
@@ -5317,7 +5505,37 @@ export default function App() {
             </div>
           </section>
         </main>
-      </div>
+
+        ) : (
+          <CvaRiskScreen
+            onOpenCounterparty={(row) =>
+              setActiveDrilldown({
+                type: 'counterparty',
+                title: row.counterparty?.name || 'Counterparty Risk',
+                row,
+                currency: row.currency,
+              })
+            }
+            onOpenBucket={(bucket) =>
+              setActiveDrilldown({
+                type: 'bucket',
+                title: `Bucket: ${bucket.label}`,
+                bucket,
+                currency: 'USD',
+              })
+            }
+            onOpenRun={(summary) =>
+              setActiveDrilldown({
+                type: 'run',
+                title: 'CVA Risk Run Context',
+                runId: summary?.calculation_run_id || 'CVA-RISK-LIVE-VIEW',
+                model: summary?.model_version || 'MVP-CVA-RISK-0.1',
+                counterparty: 'Portfolio',
+                trades: summary?.portfolio?.trades || 0,
+              })
+            }
+          />
+        )}      </div>
 
       {activeDrilldown && (
         <DrilldownDrawer activeDrilldown={activeDrilldown} onClose={closeDrilldown} currency={form.currency} />
@@ -5417,6 +5635,67 @@ function DrilldownDrawer({ activeDrilldown, onClose, currency }) {
           </div>
         )}
 
+
+        {activeDrilldown.type === 'counterparty' && (
+          <div className="space-y-4 text-sm text-white/70">
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
+              <div className="text-xs uppercase tracking-[0.16em] text-white/45">Counterparty</div>
+              <div className="mt-1 text-lg text-white">{activeDrilldown.row?.counterparty?.name}</div>
+              <div className="mt-1 font-mono text-white/50">{activeDrilldown.row?.netting_set?.id}</div>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <RiskMiniStat label="CVA" value={formatCompactCurrency(activeDrilldown.row?.cva, activeDrilldown.row?.currency || currency)} />
+              <RiskMiniStat label="Peak EPE" value={formatCompactCurrency(activeDrilldown.row?.peak_epe, activeDrilldown.row?.currency || currency)} />
+              <RiskMiniStat label="Credit Spread" value={`${activeDrilldown.row?.credit_spread_bps ?? '—'} bps`} />
+              <RiskMiniStat label="LGD" value={formatPercent(activeDrilldown.row?.lgd)} />
+            </div>
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
+              <div className="mb-3 text-xs uppercase tracking-[0.16em] text-white/45">Causal Explanation</div>
+              <div className="space-y-2">
+                <div className="flex justify-between"><span>Exposure driver</span><span className="text-white">{formatCompactCurrency(activeDrilldown.row?.peak_epe, activeDrilldown.row?.currency || currency)}</span></div>
+                <div className="flex justify-between"><span>Credit driver</span><span className="text-white">{activeDrilldown.row?.credit_spread_bps} bps</span></div>
+                <div className="flex justify-between"><span>Loss assumption</span><span className="text-white">{formatPercent(activeDrilldown.row?.lgd)}</span></div>
+                <div className="flex justify-between"><span>Primary driver</span><span className="text-[#82C7A5]">{activeDrilldown.row?.driver}</span></div>
+              </div>
+            </div>
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
+              <div className="mb-3 text-xs uppercase tracking-[0.16em] text-white/45">Largest Trades</div>
+              <div className="space-y-2">
+                {(activeDrilldown.row?.trades || []).slice(0, 6).map((trade) => (
+                  <div key={trade.trade_id} className="rounded-lg border border-white/10 bg-black/10 p-3">
+                    <div className="flex justify-between gap-3 text-white">
+                      <span>{trade.external_trade_id || trade.trade_id}</span>
+                      <span>{formatCompactCurrency(trade.notional, trade.currency)}</span>
+                    </div>
+                    <div className="mt-1 flex justify-between text-white/45">
+                      <span>{trade.direction} · {trade.fixed_rate}% · {trade.floating_index}</span>
+                      <span>{trade.maturity}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeDrilldown.type === 'bucket' && (
+          <div className="space-y-4 text-sm text-white/70">
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
+              <div className="text-xs uppercase tracking-[0.16em] text-white/45">Time Bucket</div>
+              <div className="mt-1 text-lg text-white">{bucket.label}</div>
+              <div className="mt-1 font-mono text-white/50">{bucket.date}</div>
+            </div>
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4 space-y-2">
+              <div className="flex justify-between"><span>Portfolio EPE</span><span>{formatCompactCurrency(bucket.epe, currency)}</span></div>
+              <div className="flex justify-between"><span>Portfolio PFE 95</span><span>{formatCompactCurrency(bucket.pfe_95, currency)}</span></div>
+              <div className="flex justify-between"><span>CVA Contribution</span><span className="text-[#82C7A5]">{formatCompactCurrency(-Math.abs(bucket.cva_contribution || 0), currency)}</span></div>
+            </div>
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4 leading-relaxed">
+              This bucket view links the risk number back to expected exposure, PFE and marginal CVA contribution. The current MVP uses the existing trade set and simplified credit assumptions.
+            </div>
+          </div>
+        )}
+
         {activeDrilldown.type === 'nettingSet' && (
           <div className="space-y-3 text-sm text-white/70">
             <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
@@ -5464,6 +5743,290 @@ function DrilldownDrawer({ activeDrilldown, onClose, currency }) {
       </div>
     </div>
   )
+}
+
+function CvaRiskScreen({ onOpenCounterparty, onOpenBucket, onOpenRun }) {
+  const [summary, setSummary] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [filters, setFilters] = useState({
+    counterpartyId: 'ALL',
+    currency: 'ALL',
+    bucket: 'ALL',
+    view: 'CVA',
+  })
+
+  useEffect(() => {
+    setLoading(true)
+    axios
+      .get(`${API_BASE}/screens/cva-risk/summary`)
+      .then((res) => setSummary(res.data))
+      .catch((err) => setError(err.response?.data?.detail || err.message))
+      .finally(() => setLoading(false))
+  }, [])
+
+  const allRows = summary?.counterparties || []
+  const currencies = useMemo(() => {
+    return ['ALL', ...Array.from(new Set(allRows.map((row) => row.currency).filter(Boolean))).sort()]
+  }, [allRows])
+
+  const bucketLabels = useMemo(() => {
+    const labels = new Set()
+    ;(summary?.buckets || []).forEach((bucket) => labels.add(bucket.label))
+    allRows.forEach((row) => (row.exposure_profile || []).forEach((bucket) => labels.add(bucket.label)))
+    return ['ALL', ...Array.from(labels)]
+  }, [summary, allRows])
+
+  const filteredRows = useMemo(() => {
+    return allRows.filter((row) => {
+      const counterpartyMatch = filters.counterpartyId === 'ALL' || row.counterparty?.id === filters.counterpartyId
+      const currencyMatch = filters.currency === 'ALL' || row.currency === filters.currency
+      return counterpartyMatch && currencyMatch
+    })
+  }, [allRows, filters.counterpartyId, filters.currency])
+
+  const selected = useMemo(() => {
+    if (filters.counterpartyId !== 'ALL') {
+      return filteredRows.find((row) => row.counterparty?.id === filters.counterpartyId) || filteredRows[0]
+    }
+    return filteredRows[0] || allRows[0]
+  }, [filteredRows, allRows, filters.counterpartyId])
+
+  const activeCurrency = filters.currency === 'ALL' ? selected?.currency || 'USD' : filters.currency
+  const sourceBuckets = filters.counterpartyId === 'ALL'
+    ? summary?.buckets || []
+    : selected?.exposure_profile || []
+  const buckets = (sourceBuckets || []).filter((bucket) => filters.bucket === 'ALL' || bucket.label === filters.bucket)
+  const chartData = buckets.length > 0 ? buckets : sourceBuckets || []
+
+  const filteredPortfolio = useMemo(() => {
+    const rows = filteredRows.length ? filteredRows : allRows
+
+    const cva = rows.reduce((total, row) => total + Number(row.cva || 0), 0)
+    const dva = rows.reduce((total, row) => total + Number(row.dva || 0), 0)
+    const netCva = rows.reduce((total, row) => total + Number(row.net_cva || 0), 0)
+    const cs01 = rows.reduce((total, row) => total + Math.abs(Number(row.cs01 || 0)), 0)
+    const peakEpe = Math.max(...rows.map((row) => Number(row.peak_epe || 0)), 0)
+    const trades = rows.reduce((total, row) => total + Number(row.netting_set?.trade_count || 0), 0)
+
+    return {
+      cva: cva || Math.abs(Number(summary?.portfolio?.cva || 0)),
+      dva: dva || Math.abs(Number(summary?.portfolio?.dva || 0)),
+      net_cva: netCva || Math.abs(Number(summary?.portfolio?.net_cva || 0)),
+      cs01: cs01 || summary?.portfolio?.cs01,
+      peak_epe: peakEpe || summary?.portfolio?.peak_epe,
+      counterparties: rows.length || summary?.portfolio?.counterparties,
+      trades: trades || summary?.portfolio?.trades,
+    }
+  }, [filteredRows, allRows, summary])
+  
+
+
+
+  if (loading) {
+    return <main className="mt-5 flex flex-1 items-center justify-center rounded-xl border border-white/10 bg-[#222B3A] text-white/60">Loading CVA risk from backend…</main>
+  }
+
+  if (error) {
+    return <main className="mt-5 rounded-xl border border-red-400/30 bg-red-500/10 p-6 text-red-200">{error}</main>
+  }
+
+  return (
+    <main className="mt-5 grid flex-1 grid-cols-1 gap-5 xl:grid-cols-[430px_minmax(0,1fr)]">
+      <aside className="grid content-start gap-5">
+        <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+          <div className="mb-4 flex items-center justify-between border-b border-white/10 pb-3">
+            <div>
+              <PaneTitle>Risk Filters</PaneTitle>
+              <p className="text-xs text-white/45">Portfolio lens for CVA, exposure and CS01</p>
+            </div>
+            <span className="rounded-full border border-[#82C7A5]/30 bg-[#82C7A5]/10 px-3 py-1 text-[11px] uppercase tracking-[0.14em] text-[#82C7A5]">Live</span>
+          </div>
+
+          <div className="space-y-4">
+            <label className="block">
+              <div className="mb-1 text-[11px] uppercase tracking-[0.16em] text-white/45">Counterparty</div>
+              <select value={filters.counterpartyId} onChange={(e) => handleFilterChange('counterpartyId', e.target.value)} className="w-full rounded-lg border border-white/10 bg-[#1B212C] px-3 py-2 text-sm text-white outline-none transition focus:border-[#82C7A5]/60">
+                <option value="ALL">All counterparties</option>
+                {allRows.map((row) => <option key={row.counterparty?.id} value={row.counterparty?.id}>{row.counterparty?.name}</option>)}
+              </select>
+            </label>
+
+            <div className="grid grid-cols-2 gap-3">
+              <label className="block">
+                <div className="mb-1 text-[11px] uppercase tracking-[0.16em] text-white/45">Currency</div>
+                <select value={filters.currency} onChange={(e) => handleFilterChange('currency', e.target.value)} className="w-full rounded-lg border border-white/10 bg-[#1B212C] px-3 py-2 text-sm text-white outline-none transition focus:border-[#82C7A5]/60">
+                  {currencies.map((currency) => <option key={currency} value={currency}>{currency === 'ALL' ? 'All' : currency}</option>)}
+                </select>
+              </label>
+
+              <label className="block">
+                <div className="mb-1 text-[11px] uppercase tracking-[0.16em] text-white/45">Time Bucket</div>
+                <select value={filters.bucket} onChange={(e) => handleFilterChange('bucket', e.target.value)} className="w-full rounded-lg border border-white/10 bg-[#1B212C] px-3 py-2 text-sm text-white outline-none transition focus:border-[#82C7A5]/60">
+                  {bucketLabels.map((bucket) => <option key={bucket} value={bucket}>{bucket === 'ALL' ? 'All' : bucket}</option>)}
+                </select>
+              </label>
+            </div>
+
+            <label className="block">
+              <div className="mb-1 text-[11px] uppercase tracking-[0.16em] text-white/45">View Mode</div>
+              <select value={filters.view} onChange={(e) => handleFilterChange('view', e.target.value)} className="w-full rounded-lg border border-white/10 bg-[#1B212C] px-3 py-2 text-sm text-white outline-none transition focus:border-[#82C7A5]/60">
+                <option value="CVA">CVA</option>
+                <option value="EXPOSURE">Exposure</option>
+                <option value="CS01">CS01</option>
+              </select>
+            </label>
+          </div>
+
+          <button type="button" onClick={() => onOpenRun?.(summary)} className="mt-5 w-full rounded-lg border border-[#0145AC]/50 bg-[#0145AC]/25 px-3 py-2 text-left text-xs uppercase tracking-[0.16em] text-white/75 transition hover:border-[#82C7A5]/60 hover:bg-[#82C7A5]/10">
+            View CVA run context
+          </button>
+        </section>
+
+        <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+          <PaneTitle>Filtered Risk Summary</PaneTitle>
+          <div className="grid grid-cols-2 gap-3">
+            <RiskMiniStat label="CVA" value={formatCompactCurrency(filteredPortfolio.cva, activeCurrency)} tone="green" />
+            <RiskMiniStat label="Peak EPE" value={formatCompactCurrency(filteredPortfolio.peak_epe, activeCurrency)} />
+            <RiskMiniStat label="CS01" value={formatCompactCurrency(filteredPortfolio.cs01, activeCurrency)} />
+            <RiskMiniStat label="Trades" value={filteredPortfolio.trades ?? '—'} />
+          </div>
+          <div className="mt-4 rounded-lg border border-white/10 bg-black/10 p-3 text-xs leading-relaxed text-white/55">
+            Filters are client-side over the CVA summary payload. They change the selected counterparties, chart, bucket table and summary numbers without introducing new workflow plumbing.
+          </div>
+        </section>
+      </aside>
+
+      <section className="grid min-w-0 grid-rows-[auto_auto_1fr] gap-5">
+        <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+          <div className="flex items-start justify-between gap-5">
+            <div>
+              <PaneTitle>{filters.counterpartyId === 'ALL' ? 'Portfolio CVA Risk' : 'Selected Counterparty'}</PaneTitle>
+              <h2 className="font-display text-2xl font-semibold text-white">{filters.counterpartyId === 'ALL' ? 'All Counterparties' : selected?.counterparty?.name || '—'}</h2>
+              <p className="mt-1 text-sm text-white/50">CVA is decomposed into exposure, credit spread and LGD so the number feels causal rather than arbitrary.</p>
+            </div>
+            <div className="grid min-w-[620px] grid-cols-6 gap-3">
+              <RiskMiniStat
+                label="CVA"
+                value={formatCompactCurrency(filteredPortfolio.cva, activeCurrency)}
+              />
+             <RiskMiniStat
+                label="DVA"
+                value={formatCompactCurrency(filteredPortfolio.dva, activeCurrency)}
+              />
+              <RiskMiniStat
+                 label="Net CVA"
+                 value={formatCompactCurrency(filteredPortfolio.net_cva, activeCurrency)}
+              />
+              <RiskMiniStat label="Names" value={filteredPortfolio.counterparties?.length ?? '—'} />
+              <RiskMiniStat label="Bucket" value={filters.bucket === 'ALL' ? 'All' : filters.bucket} />
+              <RiskMiniStat label="Currency" value={filters.currency === 'ALL' ? 'All' : filters.currency} />
+            </div>
+          </div>
+        </section>
+
+        <section className="grid gap-5 2xl:grid-cols-[minmax(0,1fr)_360px]">
+          <RiskProfileChart data={chartData} currency={activeCurrency} onOpenBucket={onOpenBucket} />
+          <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+            <PaneTitle>Risk Drivers</PaneTitle>
+            <div className="space-y-3 text-sm text-white/70">
+              <DriverRow label="Exposure" value={formatCompactCurrency(selected?.peak_epe || filteredPortfolio.peak_epe, activeCurrency)} detail="Peak EPE" />
+              <DriverRow label="Credit" value={selected?.credit_spread_bps ? `${selected.credit_spread_bps} bps` : 'Portfolio blend'} detail="5Y spread proxy" />
+              <DriverRow label="LGD" value={selected?.lgd ? formatPercent(selected.lgd) : 'Name-weighted'} detail={selected?.recovery_rate ? `${formatPercent(selected.recovery_rate)} recovery` : 'recovery assumption'} />
+              <div className="rounded-lg border border-[#82C7A5]/20 bg-[#82C7A5]/10 p-3 text-[#82C7A5]">Primary driver: {selected?.driver || 'Exposure concentration'}</div>
+            </div>
+          </section>
+        </section>
+
+        <section className="grid min-h-0 gap-5 2xl:grid-cols-[minmax(0,1fr)_430px]">
+          <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+            <PaneTitle>{filters.view} by Time Bucket</PaneTitle>
+            <div className="overflow-hidden rounded-lg border border-white/10">
+              <table className="w-full border-collapse text-xs">
+                <thead className="bg-white/[0.03] text-white/45">
+                  <tr><th className="px-3 py-2 text-left font-normal">Bucket</th><th className="px-3 py-2 text-right font-normal">EPE</th><th className="px-3 py-2 text-right font-normal">PFE 95</th><th className="px-3 py-2 text-right font-normal">CVA Contribution</th></tr>
+                </thead>
+                <tbody>
+                  {buckets.map((bucket) => (
+                    <tr key={bucket.label} onClick={() => onOpenBucket?.(bucket)} className="cursor-pointer border-t border-white/5 transition hover:bg-white/[0.04]">
+                      <td className="px-3 py-2 text-white/80">{bucket.label}</td>
+                      <td className="px-3 py-2 text-right font-mono text-white">{formatCompactCurrency(bucket.epe, activeCurrency)}</td>
+                      <td className="px-3 py-2 text-right font-mono text-white/70">{formatCompactCurrency(bucket.pfe_95, activeCurrency)}</td>
+                      <td className="px-3 py-2 text-right font-mono text-[#82C7A5]">{formatCompactCurrency(-Math.abs(bucket.cva_contribution || 0), activeCurrency)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+            <PaneTitle>Counterparty Risk</PaneTitle>
+            <div className="space-y-2">
+              {filteredRows.map((row) => (
+                <button key={row.counterparty?.id} type="button" onClick={() => { handleFilterChange('counterpartyId', row.counterparty?.id); onOpenCounterparty?.(row) }} className="w-full rounded-lg border border-white/10 bg-black/10 p-3 text-left transition hover:border-[#82C7A5]/40 hover:bg-[#82C7A5]/5">
+                  <div className="flex justify-between gap-3 text-sm text-white"><span>{row.counterparty?.name}</span><span>{formatCompactCurrency(row.cva, row.currency)}</span></div>
+                  <div className="mt-1 flex justify-between text-xs text-white/45"><span>{row.netting_set?.trade_count} trades · {row.currency}</span><span>{row.driver}</span></div>
+                </button>
+              ))}
+            </div>
+          </section>
+        </section>
+      </section>
+    </main>
+  )
+}
+
+function RiskProfileChart({ data, currency, onOpenBucket }) {
+  const width = 760
+  const height = 250
+  const padX = 42
+  const padY = 30
+  const maxEpe = Math.max(...(data || []).map((p) => Number(p.epe || 0)), 1)
+  const maxPfe = Math.max(...(data || []).map((p) => Number(p.pfe_95 || 0)), maxEpe)
+  const max = Math.max(maxEpe, maxPfe)
+  const points = (data || []).map((point, index) => {
+    const x = padX + (index * (width - padX * 2)) / Math.max((data || []).length - 1, 1)
+    const epeY = height - padY - (Number(point.epe || 0) / max) * (height - padY * 2)
+    const pfeY = height - padY - (Number(point.pfe_95 || 0) / max) * (height - padY * 2)
+    return { ...point, x, epeY, pfeY }
+  })
+  const epePath = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.epeY}`).join(' ')
+  const pfePath = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${p.x} ${p.pfeY}`).join(' ')
+
+  return (
+    <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+      <PaneTitle>Exposure Profile — EPE / PFE</PaneTitle>
+      <svg viewBox={`0 0 ${width} ${height}`} className="h-[300px] w-full overflow-visible">
+        <line x1={padX} y1={height - padY} x2={width - padX} y2={height - padY} stroke="rgba(255,255,255,0.18)" />
+        <line x1={padX} y1={padY} x2={padX} y2={height - padY} stroke="rgba(255,255,255,0.18)" />
+        <path d={pfePath} fill="none" stroke="#0145AC" strokeWidth="3" opacity="0.9" />
+        <path d={epePath} fill="none" stroke="#82C7A5" strokeWidth="3" />
+        {points.map((point) => (
+          <g key={point.label} onClick={() => onOpenBucket?.(point)} className="cursor-pointer">
+            <circle cx={point.x} cy={point.epeY} r="5" fill="#82C7A5" />
+            <circle cx={point.x} cy={point.pfeY} r="4" fill="#0145AC" />
+            <text x={point.x} y={height - 8} textAnchor="middle" fill="rgba(255,255,255,0.5)" fontSize="11">{point.label}</text>
+          </g>
+        ))}
+        <text x={padX} y="14" fill="rgba(255,255,255,0.5)" fontSize="11">Peak {formatCompactCurrency(max, currency)}</text>
+      </svg>
+      <div className="mt-2 flex gap-5 text-xs text-white/50"><span><span className="mr-2 inline-block h-2 w-2 rounded-full bg-[#82C7A5]" />EPE</span><span><span className="mr-2 inline-block h-2 w-2 rounded-full bg-[#0145AC]" />PFE 95</span></div>
+    </section>
+  )
+}
+
+function RiskMiniStat({ label, value, tone }) {
+  return <div className="rounded-lg border border-white/10 bg-black/10 px-3 py-2"><div className="text-[11px] uppercase tracking-[0.14em] text-white/40">{label}</div><div className={`mt-1 font-mono text-lg ${tone === 'green' ? 'text-[#82C7A5]' : 'text-white'}`}>{value}</div></div>
+}
+
+function DriverRow({ label, value, detail }) {
+  return <div className="flex items-center justify-between rounded-lg border border-white/10 bg-black/10 p-3"><div><div className="text-white">{label}</div><div className="text-xs text-white/40">{detail}</div></div><div className="font-mono text-white">{value}</div></div>
+}
+
+function formatPercent(value) {
+  if (value === undefined || value === null || Number.isNaN(Number(value))) return '—'
+  return `${(Number(value) * 100).toFixed(1)}%`
 }
 
 function MarketDataPanel({ parRates, currency, index, composition, selectedNotional, onNettingDrilldown }) {
@@ -5554,6 +6117,7 @@ function formatCompactCurrency(value, currency) {
 function currencySymbol(currency) {
   return currency === 'GBP' ? '£' : currency === 'EUR' ? '€' : currency === 'CHF' ? 'CHF ' : '$'
 }
+
 
 ====================================================================================================
 FILE: frontend\src\assets\hero.png

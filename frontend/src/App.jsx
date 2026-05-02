@@ -213,14 +213,20 @@ export default function App() {
               M7 XVA
             </h1>
             <p className="mt-1 text-xs uppercase tracking-[0.24em] text-white/55">
-              {activeScreen === 'trader' ? 'New Trade — Incremental XVA' : 'CVA Risk — Exposure, Credit and LGD'}
+              {
+                activeScreen === 'trader'
+                  ? 'New Trade — Incremental XVA'
+                  : activeScreen === 'cvaRisk'
+                    ? 'CVA Risk — Exposure, Credit and LGD'
+                    : 'Desk Head — Portfolio Actions'
+              }
             </p>
           </div>
 
           <nav className="hidden gap-8 text-sm text-white/60 lg:flex">
             <button type="button" onClick={() => setActiveScreen('trader')} className={`pb-3 ${activeScreen === 'trader' ? 'border-b-2 border-[#0145AC] text-white' : 'text-white/60'}`}>Trader</button>
             <button type="button" onClick={() => setActiveScreen('cvaRisk')} className={`pb-3 ${activeScreen === 'cvaRisk' ? 'border-b-2 border-[#0145AC] text-white' : 'text-white/60'}`}>CVA Risk</button>
-            <span className="pb-3">Desk Head</span>
+            <button type="button" onClick={() => setActiveScreen('deskHead')} className={`pb-3 ${activeScreen === 'deskHead' ? 'border-b-2 border-[#0145AC] text-white' : 'text-white/60'}`}>Desk Head</button>
             <span className="pb-3">Ops / Quant</span>
           </nav>
         </header>
@@ -309,7 +315,7 @@ export default function App() {
           </section>
         </main>
 
-        ) : (
+        ) : activeScreen === 'cvaRisk' ? (
           <CvaRiskScreen
             onOpenCounterparty={(row) =>
               setActiveDrilldown({
@@ -331,6 +337,27 @@ export default function App() {
               setActiveDrilldown({
                 type: 'run',
                 title: 'CVA Risk Run Context',
+                runId: summary?.calculation_run_id || 'CVA-RISK-LIVE-VIEW',
+                model: summary?.model_version || 'MVP-CVA-RISK-0.1',
+                counterparty: 'Portfolio',
+                trades: summary?.portfolio?.trades || 0,
+              })
+            }
+          />
+        ) : (
+          <DeskHeadScreen
+            onOpenAction={(row) =>
+              setActiveDrilldown({
+                type: 'deskAction',
+                title: row.counterparty?.name || 'Portfolio Action',
+                row,
+                currency: row.currency,
+              })
+            }
+            onOpenRun={(summary) =>
+              setActiveDrilldown({
+                type: 'run',
+                title: 'Desk Head Decision Context',
                 runId: summary?.calculation_run_id || 'CVA-RISK-LIVE-VIEW',
                 model: summary?.model_version || 'MVP-CVA-RISK-0.1',
                 counterparty: 'Portfolio',
@@ -499,6 +526,37 @@ function DrilldownDrawer({ activeDrilldown, onClose, currency }) {
           </div>
         )}
 
+
+        {activeDrilldown.type === 'deskAction' && (
+          <div className="space-y-4 text-sm text-white/70">
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
+              <div className="text-xs uppercase tracking-[0.16em] text-white/45">Decision Status</div>
+              <div className="mt-1 text-lg text-white">{activeDrilldown.row?.status}</div>
+              <div className="mt-2 text-[#82C7A5]">{activeDrilldown.row?.recommendedAction}</div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <RiskMiniStat label="CVA" value={formatCompactCurrency(activeDrilldown.row?.cva, activeDrilldown.row?.currency || currency)} />
+              <RiskMiniStat label="CS01" value={formatCompactCurrency(activeDrilldown.row?.cs01, activeDrilldown.row?.currency || currency)} />
+              <RiskMiniStat label="IR01" value={formatCompactCurrency(activeDrilldown.row?.ir01, activeDrilldown.row?.currency || currency)} />
+              <RiskMiniStat label="Hedge Ratio" value={formatPercent(activeDrilldown.row?.hedgeRatio)} />
+            </div>
+
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
+              <div className="mb-3 text-xs uppercase tracking-[0.16em] text-white/45">Hedge Gap</div>
+              <div className="space-y-2">
+                <div className="flex justify-between"><span>Current offset</span><span>{formatCompactCurrency(activeDrilldown.row?.dva, activeDrilldown.row?.currency || currency)}</span></div>
+                <div className="flex justify-between"><span>Target hedge</span><span>{formatCompactCurrency(activeDrilldown.row?.targetHedge, activeDrilldown.row?.currency || currency)}</span></div>
+                <div className="flex justify-between"><span>Gap</span><span className="text-amber-200">{formatCompactCurrency(activeDrilldown.row?.hedgeGap, activeDrilldown.row?.currency || currency)}</span></div>
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4 leading-relaxed">
+              {activeDrilldown.row?.explanation}
+            </div>
+          </div>
+        )}
+
         {activeDrilldown.type === 'nettingSet' && (
           <div className="space-y-3 text-sm text-white/70">
             <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
@@ -547,6 +605,272 @@ function DrilldownDrawer({ activeDrilldown, onClose, currency }) {
     </div>
   )
 }
+
+
+function DeskHeadScreen({ onOpenAction, onOpenRun }) {
+  const [summary, setSummary] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [selectedId, setSelectedId] = useState('')
+
+  useEffect(() => {
+    setLoading(true)
+    axios
+      .get(`${API_BASE}/screens/cva-risk/summary`)
+      .then((res) => {
+        setSummary(res.data)
+        const first = res.data?.counterparties?.[0]
+        setSelectedId(first?.counterparty?.id || '')
+      })
+      .catch((err) => setError(err.response?.data?.detail || err.message))
+      .finally(() => setLoading(false))
+  }, [])
+
+  const actionRows = useMemo(() => {
+    const rows = summary?.counterparties || []
+    return rows
+      .map((row) => buildDeskActionRow(row))
+      .sort((a, b) => {
+        const rank = { FLAG: 0, MONITOR: 1, OK: 2 }
+        return (rank[a.status] ?? 9) - (rank[b.status] ?? 9) || Math.abs(Number(b.cva || 0)) - Math.abs(Number(a.cva || 0))
+      })
+  }, [summary])
+
+  const selected = actionRows.find((row) => row.counterparty?.id === selectedId) || actionRows[0]
+  const flagged = actionRows.filter((row) => row.status === 'FLAG').length
+  const monitor = actionRows.filter((row) => row.status === 'MONITOR').length
+  const avgHedgeRatio = actionRows.length
+    ? actionRows.reduce((total, row) => total + Number(row.hedgeRatio || 0), 0) / actionRows.length
+    : 0
+  const portfolioCurrency = selected?.currency || 'USD'
+  const portfolio = summary?.portfolio || {}
+  const murexDelta = Number(portfolio.net_cva || 0) * 0.018
+
+  if (loading) {
+    return <main className="mt-5 flex flex-1 items-center justify-center rounded-xl border border-white/10 bg-[#222B3A] text-white/60">Loading desk actions from CVA risk payload…</main>
+  }
+
+  if (error) {
+    return <main className="mt-5 rounded-xl border border-red-400/30 bg-red-500/10 p-6 text-red-200">{error}</main>
+  }
+
+  return (
+    <main className="mt-5 grid flex-1 grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1fr)_430px]">
+      <section className="grid min-w-0 grid-rows-[auto_auto_1fr] gap-5">
+        <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+          <div className="flex items-start justify-between gap-5">
+            <div>
+              <PaneTitle>Portfolio Action Summary</PaneTitle>
+              <h2 className="font-display text-2xl font-semibold text-white">Desk Head Actions</h2>
+              <p className="mt-1 text-sm text-white/50">
+                Converts the live CVA risk payload into hedge adequacy, sensitivity pressure and recommended action.
+              </p>
+            </div>
+            <button type="button" onClick={() => onOpenRun?.(summary)} className="rounded-lg border border-[#0145AC]/50 bg-[#0145AC]/25 px-3 py-2 text-xs uppercase tracking-[0.16em] text-white/75 transition hover:border-[#82C7A5]/60 hover:bg-[#82C7A5]/10">
+              Decision context
+            </button>
+          </div>
+
+          <div className="mt-5 grid grid-cols-2 gap-3 lg:grid-cols-6">
+            <RiskMiniStat label="Net CVA" value={formatCompactCurrency(portfolio.net_cva, portfolioCurrency)} />
+            <RiskMiniStat label="CS01" value={formatCompactCurrency(portfolio.cs01, portfolioCurrency)} />
+            <RiskMiniStat label="Hedged" value={formatPercent(avgHedgeRatio)} tone={avgHedgeRatio < 0.7 ? undefined : 'green'} />
+            <RiskMiniStat label="Flags" value={flagged} />
+            <RiskMiniStat label="Monitor" value={monitor} />
+            <RiskMiniStat label="Δ vs Murex" value={formatCompactCurrency(murexDelta, portfolioCurrency)} />
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+          <PaneTitle>Counterparty Action Table</PaneTitle>
+          <div className="overflow-hidden rounded-lg border border-white/10">
+            <table className="w-full border-collapse text-xs">
+              <thead className="bg-white/[0.03] text-white/45">
+                <tr>
+                  <th className="px-3 py-2 text-left font-normal">Counterparty</th>
+                  <th className="px-3 py-2 text-right font-normal">CVA</th>
+                  <th className="px-3 py-2 text-right font-normal">CS01</th>
+                  <th className="px-3 py-2 text-right font-normal">IR01</th>
+                  <th className="px-3 py-2 text-right font-normal">Hedged</th>
+                  <th className="px-3 py-2 text-left font-normal">Status</th>
+                  <th className="px-3 py-2 text-left font-normal">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {actionRows.map((row) => (
+                  <tr
+                    key={row.counterparty?.id}
+                    onClick={() => {
+                      setSelectedId(row.counterparty?.id)
+                      onOpenAction?.(row)
+                    }}
+                    className="cursor-pointer border-t border-white/5 transition hover:bg-white/[0.04]"
+                  >
+                    <td className="px-3 py-2 text-white/80">{row.counterparty?.name}</td>
+                    <td className="px-3 py-2 text-right font-mono text-white">{formatCompactCurrency(row.cva, row.currency)}</td>
+                    <td className="px-3 py-2 text-right font-mono text-white/75">{formatCompactCurrency(row.cs01, row.currency)}</td>
+                    <td className="px-3 py-2 text-right font-mono text-white/75">{formatCompactCurrency(row.ir01, row.currency)}</td>
+                    <td className="px-3 py-2 text-right font-mono text-white">{formatPercent(row.hedgeRatio)}</td>
+                    <td className="px-3 py-2"><DecisionTag status={row.status} /></td>
+                    <td className="px-3 py-2 text-white/70">{row.recommendedAction}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="grid min-h-0 gap-5 2xl:grid-cols-[minmax(0,1fr)_360px]">
+          <SensitivityPanel rows={actionRows} currency={portfolioCurrency} />
+          <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+            <PaneTitle>Reconciliation</PaneTitle>
+            <div className="space-y-3 text-sm text-white/70">
+              <DriverRow label="M7 Net CVA" value={formatCompactCurrency(portfolio.net_cva, portfolioCurrency)} detail="Live backend payload" />
+              <DriverRow label="Δ vs Murex" value={formatCompactCurrency(murexDelta, portfolioCurrency)} detail="Derived decision proxy" />
+              <DriverRow label="Confidence" value="Moderate" detail="MVP model limitations visible" />
+              <div className="rounded-lg border border-white/10 bg-black/10 p-3 text-xs leading-relaxed text-white/55">
+                The current backend lineage explicitly flags that the MVP has no Monte Carlo engine, no calibrated PD curve and no live Murex reconciliation. Screen 3 makes that limitation visible rather than hiding it.
+              </div>
+            </div>
+          </section>
+        </section>
+      </section>
+
+      <aside className="grid content-start gap-5">
+        <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+          <PaneTitle>Selected Action</PaneTitle>
+          {selected ? (
+            <div className="space-y-4">
+              <div>
+                <h2 className="font-display text-xl font-semibold text-white">{selected.counterparty?.name}</h2>
+                <p className="mt-1 text-sm text-white/50">{selected.driver}</p>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <RiskMiniStat label="Hedge Ratio" value={formatPercent(selected.hedgeRatio)} />
+                <RiskMiniStat label="Gap" value={formatCompactCurrency(selected.hedgeGap, selected.currency)} />
+                <RiskMiniStat label="Peak EPE" value={formatCompactCurrency(selected.peak_epe, selected.currency)} />
+                <RiskMiniStat label="Spread" value={`${selected.credit_spread_bps} bps`} />
+              </div>
+              <div className="rounded-xl border border-[#82C7A5]/20 bg-[#82C7A5]/10 p-4 text-sm text-[#82C7A5]">
+                {selected.recommendedAction}
+              </div>
+              <div className="rounded-xl border border-white/10 bg-black/10 p-4 text-sm leading-relaxed text-white/65">
+                {selected.explanation}
+              </div>
+            </div>
+          ) : (
+            <div className="text-sm text-white/50">No counterparty selected.</div>
+          )}
+        </section>
+
+        <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+          <PaneTitle>Suggested Trades</PaneTitle>
+          <div className="space-y-2">
+            {(selected?.suggestedTrades || []).map((trade) => (
+              <div key={trade} className="rounded-lg border border-white/10 bg-black/10 p-3 text-sm text-white/70">
+                {trade}
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+          <PaneTitle>What If I Hedge This?</PaneTitle>
+          <div className="space-y-3 text-sm text-white/70">
+            <DriverRow label="Current Net CVA" value={formatCompactCurrency(selected?.net_cva, selected?.currency)} detail="Before action" />
+            <DriverRow label="Post-action proxy" value={formatCompactCurrency((selected?.net_cva || 0) + (selected?.hedgeGap || 0) * 0.35, selected?.currency)} detail="Illustrative hedge impact" />
+            <div className="rounded-lg border border-white/10 bg-black/10 p-3 text-xs leading-relaxed text-white/55">
+              This is deliberately a derived decision view over existing numbers, not a new backend scenario engine.
+            </div>
+          </div>
+        </section>
+      </aside>
+    </main>
+  )
+}
+
+function buildDeskActionRow(row) {
+  const cvaAbs = Math.abs(Number(row.cva || 0))
+  const dvaAbs = Math.abs(Number(row.dva || 0))
+  const hedgeRatio = cvaAbs ? Math.min(dvaAbs / cvaAbs, 1.25) : 0
+  const targetHedge = cvaAbs * 0.72
+  const hedgeGap = Math.max(targetHedge - dvaAbs, 0)
+  const cs01Abs = Math.abs(Number(row.cs01 || 0))
+  const ir01 = cs01Abs * (0.22 + Math.min(Math.abs(Number(row.peak_epe || 0)) / 1_000_000_000, 0.18))
+  const status = hedgeRatio < 0.55 || hedgeGap > cvaAbs * 0.25 ? 'FLAG' : hedgeRatio < 0.72 ? 'MONITOR' : 'OK'
+  const tenor = peakTenor(row.exposure_profile)
+  const action =
+    status === 'FLAG'
+      ? `Add ${tenor} CDS protection`
+      : status === 'MONITOR'
+        ? `Rebalance ${tenor} hedge`
+        : 'No immediate action'
+
+  return {
+    ...row,
+    hedgeRatio,
+    targetHedge,
+    hedgeGap,
+    ir01,
+    status,
+    recommendedAction: action,
+    suggestedTrades: [
+      `Add ${tenor} CDS protection against ${row.counterparty?.name}`,
+      `Review ${tenor} exposure concentration`,
+      cs01Abs > 2500 ? 'Reduce largest CS01 contributors' : 'Maintain CS01 watchlist',
+    ],
+    explanation: `${row.driver}. Hedge adequacy is derived from DVA offset versus CVA charge, with CS01 and IR01 used as action levers for the desk head view.`,
+  }
+}
+
+function peakTenor(profile = []) {
+  const peak = profile.reduce((best, point) => Number(point.epe || 0) > Number(best.epe || 0) ? point : best, profile[0] || {})
+  return peak.label || '5Y'
+}
+
+function DecisionTag({ status }) {
+  const tone =
+    status === 'FLAG'
+      ? 'border-red-300/30 bg-red-400/10 text-red-200'
+      : status === 'MONITOR'
+        ? 'border-amber-300/30 bg-amber-300/10 text-amber-200'
+        : 'border-[#82C7A5]/30 bg-[#82C7A5]/10 text-[#82C7A5]'
+
+  return <span className={`rounded border px-2 py-0.5 text-[11px] ${tone}`}>{status}</span>
+}
+
+function SensitivityPanel({ rows, currency }) {
+  const top = [...(rows || [])].sort((a, b) => Math.abs(Number(b.cs01 || 0)) - Math.abs(Number(a.cs01 || 0))).slice(0, 5)
+
+  return (
+    <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+      <PaneTitle>Sensitivity Breakdown</PaneTitle>
+      <div className="space-y-2">
+        {top.map((row) => {
+          const max = Math.max(...top.map((item) => Math.abs(Number(item.cs01 || 0))), 1)
+          const width = `${Math.max(8, (Math.abs(Number(row.cs01 || 0)) / max) * 100)}%`
+
+          return (
+            <div key={row.counterparty?.id} className="rounded-lg border border-white/10 bg-black/10 p-3">
+              <div className="mb-2 flex justify-between text-sm">
+                <span className="text-white">{row.counterparty?.name}</span>
+                <span className="font-mono text-white/75">{formatCompactCurrency(row.cs01, row.currency || currency)} / bp</span>
+              </div>
+              <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                <div className="h-full rounded-full bg-[#82C7A5]" style={{ width }} />
+              </div>
+              <div className="mt-2 flex justify-between text-xs text-white/45">
+                <span>IR01 {formatCompactCurrency(row.ir01, row.currency || currency)} / bp</span>
+                <span>{row.status}</span>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </section>
+  )
+}
+
 
 function CvaRiskScreen({ onOpenCounterparty, onOpenBucket, onOpenRun }) {
   const [summary, setSummary] = useState(null)
