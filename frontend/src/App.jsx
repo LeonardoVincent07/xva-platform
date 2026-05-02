@@ -1148,7 +1148,7 @@ function CvaRiskScreen({ onOpenCounterparty, onOpenBucket, onOpenRun }) {
   }
 
   if (loading) {
-    return <main className="mt-5 flex flex-1 items-center justify-center rounded-xl border border-white/10 bg-[#222B3A] text-white/60">Loading CVA risk from backend…</main>
+    return <main className="mt-5 flex flex-1 items-center justify-center rounded-xl border border-white/10 bg-[#222B3A] text-white/60">Calculating CVA using path-based exposure simulation (250 paths)…</main>
   }
 
   if (error) {
