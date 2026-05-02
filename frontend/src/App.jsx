@@ -299,6 +299,7 @@ export default function App() {
                     title: `${row.label} Trades`,
                     bucket: row,
                     currency: form.currency,
+                    counterpartyId: form.counterparty_id,
                   })
                 }
               />
@@ -317,6 +318,25 @@ export default function App() {
 function DrilldownDrawer({ activeDrilldown, onClose, currency }) {
   const symbol = currencySymbol(currency)
   const bucket = activeDrilldown.bucket || {}
+  const [tradeDrilldown, setTradeDrilldown] = useState({ loading: false, error: '', trades: [] })
+
+  useEffect(() => {
+    if (activeDrilldown.type !== 'nettingSet' || !activeDrilldown.counterpartyId) {
+      setTradeDrilldown({ loading: false, error: '', trades: [] })
+      return
+    }
+
+    setTradeDrilldown({ loading: true, error: '', trades: [] })
+
+    axios
+      .get(`${API_BASE}/screens/screen1/netting-set/${activeDrilldown.counterpartyId}/trades`)
+      .then((res) => {
+        setTradeDrilldown({ loading: false, error: '', trades: res.data?.trades || [] })
+      })
+      .catch((err) => {
+        setTradeDrilldown({ loading: false, error: err.response?.data?.detail || err.message, trades: [] })
+      })
+  }, [activeDrilldown.type, activeDrilldown.counterpartyId])
 
   const formatValue = (value) => {
     if (value === undefined || value === null || value === '—') return '—'
@@ -394,15 +414,38 @@ function DrilldownDrawer({ activeDrilldown, onClose, currency }) {
               <div className="mt-1 font-mono text-white/70">{formatCompactCurrency(bucket.notional, currency)}</div>
             </div>
 
-            {[
-              ['IRS-1042', `${symbol}120M`, '3Y', 'Computed'],
-              ['IRS-1088', `${symbol}95M`, '5Y', 'Computed'],
-              ['IRS-1114', `${symbol}180M`, '5Y', 'Interpolated'],
-              ['IRS-1132', `${symbol}75M`, '7Y', 'Computed'],
-            ].map(([id, notional, maturity, source]) => (
-              <div key={id} className="rounded-xl border border-white/10 bg-[#222B3A] p-3">
-                <div className="flex justify-between text-white"><span>{id}</span><span>{notional}</span></div>
-                <div className="mt-1 flex justify-between text-white/45"><span>{maturity}</span><span>{source}</span></div>
+            {tradeDrilldown.loading && (
+              <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4 text-white/60">
+                Loading trades from database…
+              </div>
+            )}
+
+            {tradeDrilldown.error && (
+              <div className="rounded-xl border border-red-400/30 bg-red-500/10 p-4 text-red-200">
+                {tradeDrilldown.error}
+              </div>
+            )}
+
+            {!tradeDrilldown.loading && !tradeDrilldown.error && tradeDrilldown.trades.length === 0 && (
+              <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4 text-white/60">
+                No trades found for this netting set.
+              </div>
+            )}
+
+            {!tradeDrilldown.loading && !tradeDrilldown.error && tradeDrilldown.trades.map((trade) => (
+              <div key={trade.trade_id} className="rounded-xl border border-white/10 bg-[#222B3A] p-3">
+                <div className="flex justify-between gap-4 text-white">
+                  <span>{trade.external_trade_id || trade.trade_id}</span>
+                  <span>{formatCompactCurrency(trade.notional, trade.currency || currency)}</span>
+                </div>
+                <div className="mt-1 flex justify-between text-white/45">
+                  <span>{trade.product} · {trade.direction} · {trade.fixed_rate}%</span>
+                  <span>{trade.maturity}</span>
+                </div>
+                <div className="mt-1 flex justify-between text-white/35">
+                  <span>{trade.floating_index}</span>
+                  <span>{trade.maturity_date}</span>
+                </div>
               </div>
             ))}
           </div>

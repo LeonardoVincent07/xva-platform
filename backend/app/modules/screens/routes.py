@@ -82,6 +82,51 @@ def get_screen1_context(counterparty_id: str, currency: str | None = None):
         db.close()
 
 
+@router.get("/screen1/netting-set/{counterparty_id}/trades")
+def get_screen1_netting_set_trades(counterparty_id: str):
+    db = SessionLocal()
+    try:
+        counterparty, netting_set, _snapshot = get_counterparty_context(db, counterparty_id)
+        trades = (
+            db.query(IrsTrade)
+            .filter(IrsTrade.netting_set_id == netting_set.netting_set_id)
+            .order_by(IrsTrade.maturity_date.asc(), IrsTrade.trade_id.asc())
+            .all()
+        )
+
+        return {
+            "counterparty": {
+                "id": counterparty.counterparty_id,
+                "name": counterparty.name,
+            },
+            "netting_set": {
+                "id": netting_set.netting_set_id,
+                "base_currency": netting_set.base_currency,
+                "trade_count": len(trades),
+                "notional": round(sum(float(t.notional or 0) for t in trades), 2),
+            },
+            "trades": [
+                {
+                    "trade_id": t.trade_id,
+                    "external_trade_id": t.external_trade_id,
+                    "product": "IRS",
+                    "currency": t.currency,
+                    "notional": round(float(t.notional or 0), 2),
+                    "trade_date": str(t.trade_date),
+                    "effective_date": str(t.effective_date),
+                    "maturity_date": str(t.maturity_date),
+                    "maturity": maturity_label(t.effective_date, t.maturity_date),
+                    "fixed_rate": round(float(t.fixed_rate or 0) * 100, 4),
+                    "floating_index": t.floating_index,
+                    "direction": t.pay_receive_fixed,
+                }
+                for t in trades
+            ],
+        }
+    finally:
+        db.close()
+
+
 @router.post("/screen1/calculate")
 def calculate_from_screen1(request: Screen1Request):
     db = SessionLocal()
@@ -424,7 +469,13 @@ def normalise_rate_to_pct(rate: float) -> float:
     return rate * 100 if rate < 1 else rate
 
 
+def maturity_label(effective_date: date, maturity_date: date) -> str:
+    years = max(1, round((maturity_date - effective_date).days / 365))
+    return f"{years}Y"
+
+
 def to_bps(amount: float, notional: float) -> float:
     if notional == 0:
         return 0
     return amount / notional * 10000
+
