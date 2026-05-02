@@ -604,22 +604,27 @@ function CvaRiskScreen({ onOpenCounterparty, onOpenBucket, onOpenRun }) {
 
   const filteredPortfolio = useMemo(() => {
     const rows = filteredRows.length ? filteredRows : allRows
+
     const cva = rows.reduce((total, row) => total + Math.abs(Number(row.cva || 0)), 0)
+    const dva = rows.reduce((total, row) => total + Math.abs(Number(row.dva || 0)), 0)
+    const netCva = rows.reduce((total, row) => total + Math.abs(Number(row.net_cva || 0)), 0)
     const cs01 = rows.reduce((total, row) => total + Math.abs(Number(row.cs01 || 0)), 0)
     const peakEpe = Math.max(...rows.map((row) => Number(row.peak_epe || 0)), 0)
     const trades = rows.reduce((total, row) => total + Number(row.netting_set?.trade_count || 0), 0)
+
     return {
-      cva: cva || summary?.portfolio?.cva,
+      cva: cva || Math.abs(Number(summary?.portfolio?.cva || 0)),
+      dva: dva || Math.abs(Number(summary?.portfolio?.dva || 0)),
+      net_cva: netCva || Math.abs(Number(summary?.portfolio?.net_cva || 0)),
       cs01: cs01 || summary?.portfolio?.cs01,
       peak_epe: peakEpe || summary?.portfolio?.peak_epe,
       counterparties: rows.length || summary?.portfolio?.counterparties,
       trades: trades || summary?.portfolio?.trades,
     }
   }, [filteredRows, allRows, summary])
+  
 
-  const handleFilterChange = (name, value) => {
-    setFilters((current) => ({ ...current, [name]: value }))
-  }
+
 
   if (loading) {
     return <main className="mt-5 flex flex-1 items-center justify-center rounded-xl border border-white/10 bg-[#222B3A] text-white/60">Loading CVA risk from backend…</main>
