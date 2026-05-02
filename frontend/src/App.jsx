@@ -530,16 +530,21 @@ function DrilldownDrawer({ activeDrilldown, onClose, currency }) {
         {activeDrilldown.type === 'deskAction' && (
           <div className="space-y-4 text-sm text-white/70">
             <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
-              <div className="text-xs uppercase tracking-[0.16em] text-white/45">Decision Status</div>
-              <div className="mt-1 text-lg text-white">{activeDrilldown.row?.status}</div>
-              <div className="mt-2 text-[#82C7A5]">{activeDrilldown.row?.recommendedAction}</div>
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <div className="text-xs uppercase tracking-[0.16em] text-white/45">Decision Status</div>
+                  <div className="mt-1 text-lg text-white">{activeDrilldown.row?.status}</div>
+                </div>
+                <ConfidenceTag confidence={activeDrilldown.row?.actionConfidence} />
+              </div>
+              <div className="mt-3 text-[#82C7A5]">{activeDrilldown.row?.recommendedAction}</div>
             </div>
 
             <div className="grid grid-cols-2 gap-3">
               <RiskMiniStat label="CVA" value={formatCompactCurrency(activeDrilldown.row?.cva, activeDrilldown.row?.currency || currency)} />
               <RiskMiniStat label="CS01" value={formatCompactCurrency(activeDrilldown.row?.cs01, activeDrilldown.row?.currency || currency)} />
               <RiskMiniStat label="IR01" value={formatCompactCurrency(activeDrilldown.row?.ir01, activeDrilldown.row?.currency || currency)} />
-              <RiskMiniStat label="Hedge Ratio" value={formatPercent(activeDrilldown.row?.hedgeRatio)} />
+              <RiskMiniStat label="Hedge Ratio" value={`${formatPercent(activeDrilldown.row?.hedgeRatio)} / 70%`} />
             </div>
 
             <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
@@ -551,7 +556,17 @@ function DrilldownDrawer({ activeDrilldown, onClose, currency }) {
               </div>
             </div>
 
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
+              <div className="mb-3 text-xs uppercase tracking-[0.16em] text-white/45">Suggested Trades</div>
+              <div className="space-y-2">
+                {(activeDrilldown.row?.suggestedTrades || []).map((trade) => (
+                  <div key={trade} className="rounded-lg border border-white/10 bg-black/10 p-3 text-white/70">{trade}</div>
+                ))}
+              </div>
+            </div>
+
             <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4 leading-relaxed">
+              <div className="mb-2 text-xs uppercase tracking-[0.16em] text-white/45">Why this action?</div>
               {activeDrilldown.row?.explanation}
             </div>
           </div>
@@ -629,19 +644,26 @@ function DeskHeadScreen({ onOpenAction, onOpenRun }) {
   const actionRows = useMemo(() => {
     const rows = summary?.counterparties || []
     return rows
-      .map((row) => buildDeskActionRow(row))
+      .map((row) => buildDeskActionRow(row, rows))
       .sort((a, b) => {
-        const rank = { FLAG: 0, MONITOR: 1, OK: 2 }
-        return (rank[a.status] ?? 9) - (rank[b.status] ?? 9) || Math.abs(Number(b.cva || 0)) - Math.abs(Number(a.cva || 0))
+        const statusRank = { FLAG: 0, MONITOR: 1, OK: 2 }
+        const confidenceRank = { HIGH: 0, MEDIUM: 1, LOW: 2 }
+        return (
+          (statusRank[a.status] ?? 9) - (statusRank[b.status] ?? 9) ||
+          (confidenceRank[a.actionConfidence] ?? 9) - (confidenceRank[b.actionConfidence] ?? 9) ||
+          Math.abs(Number(b.cva || 0)) - Math.abs(Number(a.cva || 0))
+        )
       })
   }, [summary])
 
   const selected = actionRows.find((row) => row.counterparty?.id === selectedId) || actionRows[0]
   const flagged = actionRows.filter((row) => row.status === 'FLAG').length
   const monitor = actionRows.filter((row) => row.status === 'MONITOR').length
+  const highConfidence = actionRows.filter((row) => row.actionConfidence === 'HIGH').length
   const avgHedgeRatio = actionRows.length
     ? actionRows.reduce((total, row) => total + Number(row.hedgeRatio || 0), 0) / actionRows.length
     : 0
+  const totalGap = actionRows.reduce((total, row) => total + Number(row.hedgeGap || 0), 0)
   const portfolioCurrency = selected?.currency || 'USD'
   const portfolio = summary?.portfolio || {}
   const murexDelta = Number(portfolio.net_cva || 0) * 0.018
@@ -674,10 +696,10 @@ function DeskHeadScreen({ onOpenAction, onOpenRun }) {
           <div className="mt-5 grid grid-cols-2 gap-3 lg:grid-cols-6">
             <RiskMiniStat label="Net CVA" value={formatCompactCurrency(portfolio.net_cva, portfolioCurrency)} />
             <RiskMiniStat label="CS01" value={formatCompactCurrency(portfolio.cs01, portfolioCurrency)} />
-            <RiskMiniStat label="Hedged" value={formatPercent(avgHedgeRatio)} tone={avgHedgeRatio < 0.7 ? undefined : 'green'} />
-            <RiskMiniStat label="Flags" value={flagged} />
-            <RiskMiniStat label="Monitor" value={monitor} />
-            <RiskMiniStat label="Δ vs Murex" value={formatCompactCurrency(murexDelta, portfolioCurrency)} />
+            <RiskMiniStat label="Hedged / Target" value={`${formatPercent(avgHedgeRatio)} / 70%`} tone={avgHedgeRatio >= 0.7 ? 'green' : undefined} />
+            <RiskMiniStat label="Hedge Gap" value={formatCompactCurrency(totalGap, portfolioCurrency)} />
+            <RiskMiniStat label="Flags" value={`${flagged} / ${monitor} watch`} />
+            <RiskMiniStat label="High Confidence" value={highConfidence} />
           </div>
         </section>
 
@@ -691,45 +713,50 @@ function DeskHeadScreen({ onOpenAction, onOpenRun }) {
                   <th className="px-3 py-2 text-right font-normal">CVA</th>
                   <th className="px-3 py-2 text-right font-normal">CS01</th>
                   <th className="px-3 py-2 text-right font-normal">IR01</th>
-                  <th className="px-3 py-2 text-right font-normal">Hedged</th>
+                  <th className="px-3 py-2 text-right font-normal">Hedged / Target</th>
                   <th className="px-3 py-2 text-left font-normal">Status</th>
+                  <th className="px-3 py-2 text-left font-normal">Confidence</th>
                   <th className="px-3 py-2 text-left font-normal">Action</th>
                 </tr>
               </thead>
               <tbody>
-                {actionRows.map((row) => (
-                  <tr
-                    key={row.counterparty?.id}
-                    onClick={() => {
-                      setSelectedId(row.counterparty?.id)
-                      onOpenAction?.(row)
-                    }}
-                    className="cursor-pointer border-t border-white/5 transition hover:bg-white/[0.04]"
-                  >
-                    <td className="px-3 py-2 text-white/80">{row.counterparty?.name}</td>
-                    <td className="px-3 py-2 text-right font-mono text-white">{formatCompactCurrency(row.cva, row.currency)}</td>
-                    <td className="px-3 py-2 text-right font-mono text-white/75">{formatCompactCurrency(row.cs01, row.currency)}</td>
-                    <td className="px-3 py-2 text-right font-mono text-white/75">{formatCompactCurrency(row.ir01, row.currency)}</td>
-                    <td className="px-3 py-2 text-right font-mono text-white">{formatPercent(row.hedgeRatio)}</td>
-                    <td className="px-3 py-2"><DecisionTag status={row.status} /></td>
-                    <td className="px-3 py-2 text-white/70">{row.recommendedAction}</td>
-                  </tr>
-                ))}
+                {actionRows.map((row) => {
+                  const isSelected = row.counterparty?.id === selected?.counterparty?.id
+                  return (
+                    <tr
+                      key={row.counterparty?.id}
+                      onClick={() => {
+                        setSelectedId(row.counterparty?.id)
+                        onOpenAction?.(row)
+                      }}
+                      className={`cursor-pointer border-t border-white/5 transition ${isSelected ? 'bg-[#82C7A5]/10' : 'hover:bg-white/[0.04]'}`}
+                    >
+                      <td className="px-3 py-2 text-white/80">{row.counterparty?.name}</td>
+                      <td className="px-3 py-2 text-right font-mono text-white">{formatCompactCurrency(row.cva, row.currency)}</td>
+                      <td className="px-3 py-2 text-right font-mono text-white/75">{formatCompactCurrency(row.cs01, row.currency)}</td>
+                      <td className="px-3 py-2 text-right font-mono text-white/75">{formatCompactCurrency(row.ir01, row.currency)}</td>
+                      <td className="px-3 py-2 text-right font-mono text-white">{formatPercent(row.hedgeRatio)} / 70%</td>
+                      <td className="px-3 py-2"><DecisionTag status={row.status} /></td>
+                      <td className="px-3 py-2"><ConfidenceTag confidence={row.actionConfidence} /></td>
+                      <td className="px-3 py-2 text-white/70">{row.recommendedAction}</td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>
         </section>
 
         <section className="grid min-h-0 gap-5 2xl:grid-cols-[minmax(0,1fr)_360px]">
-          <SensitivityPanel rows={actionRows} currency={portfolioCurrency} />
+          <SensitivityPanel rows={actionRows} currency={portfolioCurrency} selectedId={selected?.counterparty?.id} />
           <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
             <PaneTitle>Reconciliation</PaneTitle>
             <div className="space-y-3 text-sm text-white/70">
               <DriverRow label="M7 Net CVA" value={formatCompactCurrency(portfolio.net_cva, portfolioCurrency)} detail="Live backend payload" />
               <DriverRow label="Δ vs Murex" value={formatCompactCurrency(murexDelta, portfolioCurrency)} detail="Derived decision proxy" />
-              <DriverRow label="Confidence" value="Moderate" detail="MVP model limitations visible" />
+              <DriverRow label="Confidence" value="Moderate" detail="No backend reconciliation feed yet" />
               <div className="rounded-lg border border-white/10 bg-black/10 p-3 text-xs leading-relaxed text-white/55">
-                The current backend lineage explicitly flags that the MVP has no Monte Carlo engine, no calibrated PD curve and no live Murex reconciliation. Screen 3 makes that limitation visible rather than hiding it.
+                Difference is currently explained as exposure interpolation and model simplification: the backend lineage says this MVP has no Monte Carlo engine, no calibrated PD curve and no live Murex reconciliation.
               </div>
             </div>
           </section>
@@ -741,12 +768,15 @@ function DeskHeadScreen({ onOpenAction, onOpenRun }) {
           <PaneTitle>Selected Action</PaneTitle>
           {selected ? (
             <div className="space-y-4">
-              <div>
-                <h2 className="font-display text-xl font-semibold text-white">{selected.counterparty?.name}</h2>
-                <p className="mt-1 text-sm text-white/50">{selected.driver}</p>
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h2 className="font-display text-xl font-semibold text-white">{selected.counterparty?.name}</h2>
+                  <p className="mt-1 text-sm text-white/50">{selected.driver}</p>
+                </div>
+                <ConfidenceTag confidence={selected.actionConfidence} />
               </div>
               <div className="grid grid-cols-2 gap-3">
-                <RiskMiniStat label="Hedge Ratio" value={formatPercent(selected.hedgeRatio)} />
+                <RiskMiniStat label="Hedge Ratio" value={`${formatPercent(selected.hedgeRatio)} / 70%`} />
                 <RiskMiniStat label="Gap" value={formatCompactCurrency(selected.hedgeGap, selected.currency)} />
                 <RiskMiniStat label="Peak EPE" value={formatCompactCurrency(selected.peak_epe, selected.currency)} />
                 <RiskMiniStat label="Spread" value={`${selected.credit_spread_bps} bps`} />
@@ -755,6 +785,7 @@ function DeskHeadScreen({ onOpenAction, onOpenRun }) {
                 {selected.recommendedAction}
               </div>
               <div className="rounded-xl border border-white/10 bg-black/10 p-4 text-sm leading-relaxed text-white/65">
+                <div className="mb-2 text-xs uppercase tracking-[0.16em] text-white/40">Why this action?</div>
                 {selected.explanation}
               </div>
             </div>
@@ -778,9 +809,11 @@ function DeskHeadScreen({ onOpenAction, onOpenRun }) {
           <PaneTitle>What If I Hedge This?</PaneTitle>
           <div className="space-y-3 text-sm text-white/70">
             <DriverRow label="Current Net CVA" value={formatCompactCurrency(selected?.net_cva, selected?.currency)} detail="Before action" />
-            <DriverRow label="Post-action proxy" value={formatCompactCurrency((selected?.net_cva || 0) + (selected?.hedgeGap || 0) * 0.35, selected?.currency)} detail="Illustrative hedge impact" />
+            <DriverRow label="Post-action proxy" value={formatCompactCurrency(selected?.postActionNetCva, selected?.currency)} detail="Illustrative hedge impact" />
+            <DriverRow label="CVA Reduction" value={formatPercent(selected?.cvaReductionPct)} detail={formatCompactCurrency(selected?.cvaReductionAmount, selected?.currency)} />
+            <DriverRow label="CS01 Reduction" value={formatPercent(selected?.cs01ReductionPct)} detail={formatCompactCurrency(selected?.cs01ReductionAmount, selected?.currency)} />
             <div className="rounded-lg border border-white/10 bg-black/10 p-3 text-xs leading-relaxed text-white/55">
-              This is deliberately a derived decision view over existing numbers, not a new backend scenario engine.
+              This remains a frontend decision proxy over existing backend numbers, not a new scenario engine.
             </div>
           </div>
         </section>
@@ -789,38 +822,115 @@ function DeskHeadScreen({ onOpenAction, onOpenRun }) {
   )
 }
 
-function buildDeskActionRow(row) {
+function buildDeskActionRow(row, allRows = []) {
   const cvaAbs = Math.abs(Number(row.cva || 0))
   const dvaAbs = Math.abs(Number(row.dva || 0))
   const hedgeRatio = cvaAbs ? Math.min(dvaAbs / cvaAbs, 1.25) : 0
-  const targetHedge = cvaAbs * 0.72
+  const targetHedgeRatio = 0.70
+  const targetHedge = cvaAbs * targetHedgeRatio
   const hedgeGap = Math.max(targetHedge - dvaAbs, 0)
   const cs01Abs = Math.abs(Number(row.cs01 || 0))
-  const ir01 = cs01Abs * (0.22 + Math.min(Math.abs(Number(row.peak_epe || 0)) / 1_000_000_000, 0.18))
-  const status = hedgeRatio < 0.55 || hedgeGap > cvaAbs * 0.25 ? 'FLAG' : hedgeRatio < 0.72 ? 'MONITOR' : 'OK'
+  const peakEpeAbs = Math.abs(Number(row.peak_epe || 0))
+  const spreadBps = Math.abs(Number(row.credit_spread_bps || 0))
+  const lgd = Number(row.lgd || 0.6)
+  const ir01 = cs01Abs * (0.22 + Math.min(peakEpeAbs / 1_000_000_000, 0.18))
   const tenor = peakTenor(row.exposure_profile)
-  const action =
-    status === 'FLAG'
-      ? `Add ${tenor} CDS protection`
-      : status === 'MONITOR'
-        ? `Rebalance ${tenor} hedge`
-        : 'No immediate action'
+
+  const maxCs01 = Math.max(...allRows.map((item) => Math.abs(Number(item.cs01 || 0))), 1)
+  const maxEpe = Math.max(...allRows.map((item) => Math.abs(Number(item.peak_epe || 0))), 1)
+  const maxSpread = Math.max(...allRows.map((item) => Math.abs(Number(item.credit_spread_bps || 0))), 1)
+  const cs01Score = cs01Abs / maxCs01
+  const epeScore = peakEpeAbs / maxEpe
+  const spreadScore = spreadBps / maxSpread
+  const hedgeGapScore = cvaAbs ? hedgeGap / cvaAbs : 0
+
+  const primaryDriver = [
+    { type: 'Credit', score: spreadScore * 1.05 },
+    { type: 'Exposure', score: epeScore },
+    { type: 'Sensitivity', score: cs01Score * 0.95 },
+  ].sort((a, b) => b.score - a.score)[0]?.type || 'Exposure'
+
+  const status = hedgeRatio < 0.55 || hedgeGapScore > 0.25 ? 'FLAG' : hedgeRatio < targetHedgeRatio ? 'MONITOR' : 'OK'
+  const confidenceScore = hedgeGapScore * 0.45 + cs01Score * 0.30 + epeScore * 0.15 + spreadScore * 0.10
+  const actionConfidence = confidenceScore >= 0.62 ? 'HIGH' : confidenceScore >= 0.42 ? 'MEDIUM' : 'LOW'
+  const cdsNotional = actionNotional(hedgeGap, spreadBps, lgd)
+  const irsNotional = actionNotional(ir01 * 65, spreadBps, lgd)
+
+  const recommendedAction = buildRecommendedAction(status, primaryDriver, tenor, cdsNotional, irsNotional)
+  const suggestedTrades = buildSuggestedTrades(row, primaryDriver, tenor, cdsNotional, irsNotional)
+
+  const cvaReductionPct = Math.min(0.28, Math.max(0.06, 0.06 + hedgeGapScore * 0.24 + cs01Score * 0.04))
+  const cs01ReductionPct = Math.min(0.32, Math.max(0.08, 0.08 + cs01Score * 0.18 + (primaryDriver === 'Sensitivity' ? 0.06 : 0)))
+  const cvaReductionAmount = cvaAbs * cvaReductionPct
+  const cs01ReductionAmount = cs01Abs * cs01ReductionPct
+  const postActionNetCva = Number(row.net_cva || 0) + cvaReductionAmount
 
   return {
     ...row,
     hedgeRatio,
+    targetHedgeRatio,
     targetHedge,
     hedgeGap,
     ir01,
     status,
-    recommendedAction: action,
-    suggestedTrades: [
-      `Add ${tenor} CDS protection against ${row.counterparty?.name}`,
-      `Review ${tenor} exposure concentration`,
-      cs01Abs > 2500 ? 'Reduce largest CS01 contributors' : 'Maintain CS01 watchlist',
-    ],
-    explanation: `${row.driver}. Hedge adequacy is derived from DVA offset versus CVA charge, with CS01 and IR01 used as action levers for the desk head view.`,
+    actionConfidence,
+    primaryDriver,
+    recommendedAction,
+    suggestedTrades,
+    cvaReductionPct,
+    cvaReductionAmount,
+    cs01ReductionPct,
+    cs01ReductionAmount,
+    postActionNetCva,
+    explanation: `${primaryDriver}-led action: ${row.driver}. Hedge ratio is ${formatPercent(hedgeRatio)} against a 70% target, leaving a ${formatCompactCurrency(hedgeGap, row.currency)} gap. The recommendation is driven by ${formatCompactCurrency(row.cs01, row.currency)} CS01, ${formatCompactCurrency(ir01, row.currency)} IR01 and peak EPE of ${formatCompactCurrency(row.peak_epe, row.currency)} at ${tenor}.`,
   }
+}
+
+function buildRecommendedAction(status, primaryDriver, tenor, cdsNotional, irsNotional) {
+  if (status === 'OK') return 'No immediate hedge action'
+  if (primaryDriver === 'Credit') return `Add ${formatWholeMillions(cdsNotional)} ${tenor} CDS protection`
+  if (primaryDriver === 'Sensitivity') return `Reduce ${formatWholeMillions(irsNotional)} ${tenor} IRS CS01`
+  return `Rebalance exposure around ${tenor}`
+}
+
+function buildSuggestedTrades(row, primaryDriver, tenor, cdsNotional, irsNotional) {
+  const name = row.counterparty?.name || 'counterparty'
+  const spread = `${row.credit_spread_bps} bps`
+
+  if (primaryDriver === 'Credit') {
+    return [
+      `Add ${formatWholeMillions(cdsNotional)} ${tenor} CDS protection against ${name}`,
+      `Move ${tenor} credit hedge to target 70% coverage`,
+      `Review high spread contribution at ${spread}`,
+    ]
+  }
+
+  if (primaryDriver === 'Sensitivity') {
+    return [
+      `Reduce ${formatWholeMillions(irsNotional)} ${tenor} IRS CS01 exposure`,
+      `Offset receiver/pay fixed imbalance in largest trades`,
+      `Keep CDS hedge unchanged unless spread widens above ${spread}`,
+    ]
+  }
+
+  return [
+    `Rebalance ${formatWholeMillions(irsNotional)} exposure away from ${tenor}`,
+    `Review largest ${tenor} IRS trades for compression`,
+    `Use CDS only for residual hedge gap after exposure reduction`,
+  ]
+}
+
+function actionNotional(amount, spreadBps, lgd) {
+  const spreadDecimal = Math.max(Number(spreadBps || 0) / 10000, 0.005)
+  const divisor = Math.max(spreadDecimal * Math.max(Number(lgd || 0.6), 0.35) * 0.035, 0.00015)
+  const raw = Math.abs(Number(amount || 0)) / divisor
+  const rounded = Math.round(raw / 5_000_000) * 5_000_000
+  return Math.min(Math.max(rounded || 10_000_000, 10_000_000), 250_000_000)
+}
+
+function formatWholeMillions(value) {
+  const millions = Math.max(1, Math.round(Math.abs(Number(value || 0)) / 1_000_000))
+  return `${millions}M`
 }
 
 function peakTenor(profile = []) {
@@ -839,19 +949,31 @@ function DecisionTag({ status }) {
   return <span className={`rounded border px-2 py-0.5 text-[11px] ${tone}`}>{status}</span>
 }
 
-function SensitivityPanel({ rows, currency }) {
+function ConfidenceTag({ confidence }) {
+  const tone =
+    confidence === 'HIGH'
+      ? 'border-[#82C7A5]/30 bg-[#82C7A5]/10 text-[#82C7A5]'
+      : confidence === 'MEDIUM'
+        ? 'border-amber-300/30 bg-amber-300/10 text-amber-200'
+        : 'border-white/15 bg-white/5 text-white/55'
+
+  return <span className={`rounded border px-2 py-0.5 text-[11px] ${tone}`}>{confidence || 'LOW'}</span>
+}
+
+function SensitivityPanel({ rows, currency, selectedId }) {
   const top = [...(rows || [])].sort((a, b) => Math.abs(Number(b.cs01 || 0)) - Math.abs(Number(a.cs01 || 0))).slice(0, 5)
+  const max = Math.max(...top.map((item) => Math.abs(Number(item.cs01 || 0))), 1)
 
   return (
     <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
       <PaneTitle>Sensitivity Breakdown</PaneTitle>
       <div className="space-y-2">
         {top.map((row) => {
-          const max = Math.max(...top.map((item) => Math.abs(Number(item.cs01 || 0))), 1)
+          const isSelected = row.counterparty?.id === selectedId
           const width = `${Math.max(8, (Math.abs(Number(row.cs01 || 0)) / max) * 100)}%`
 
           return (
-            <div key={row.counterparty?.id} className="rounded-lg border border-white/10 bg-black/10 p-3">
+            <div key={row.counterparty?.id} className={`rounded-lg border p-3 transition ${isSelected ? 'border-[#82C7A5]/40 bg-[#82C7A5]/10' : 'border-white/10 bg-black/10 opacity-55'}`}>
               <div className="mb-2 flex justify-between text-sm">
                 <span className="text-white">{row.counterparty?.name}</span>
                 <span className="font-mono text-white/75">{formatCompactCurrency(row.cs01, row.currency || currency)} / bp</span>
@@ -861,7 +983,7 @@ function SensitivityPanel({ rows, currency }) {
               </div>
               <div className="mt-2 flex justify-between text-xs text-white/45">
                 <span>IR01 {formatCompactCurrency(row.ir01, row.currency || currency)} / bp</span>
-                <span>{row.status}</span>
+                <span>{row.primaryDriver} · {row.status}</span>
               </div>
             </div>
           )
