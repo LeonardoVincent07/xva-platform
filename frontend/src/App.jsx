@@ -667,6 +667,8 @@ function DeskHeadScreen({ onOpenAction, onOpenRun }) {
   const portfolioCurrency = selected?.currency || 'USD'
   const portfolio = summary?.portfolio || {}
   const murexDelta = Number(portfolio.net_cva || 0) * 0.018
+  const primaryAction = buildPortfolioPrimaryAction(actionRows)
+  const executionOrder = buildExecutionOrder(actionRows)
 
   if (loading) {
     return <main className="mt-5 flex flex-1 items-center justify-center rounded-xl border border-white/10 bg-[#222B3A] text-white/60">Loading desk actions from CVA risk payload…</main>
@@ -698,8 +700,13 @@ function DeskHeadScreen({ onOpenAction, onOpenRun }) {
             <RiskMiniStat label="CS01" value={formatCompactCurrency(portfolio.cs01, portfolioCurrency)} />
             <RiskMiniStat label="Hedged / Target" value={`${formatPercent(avgHedgeRatio)} / 70%`} tone={avgHedgeRatio >= 0.7 ? 'green' : undefined} />
             <RiskMiniStat label="Hedge Gap" value={formatCompactCurrency(totalGap, portfolioCurrency)} />
-            <RiskMiniStat label="Flags" value={`${flagged} / ${monitor} watch`} />
+            <RiskMiniStat label="Flags / Watch" value={`${flagged} / ${monitor}`} />
             <RiskMiniStat label="High Confidence" value={highConfidence} />
+          </div>
+
+          <div className="mt-4 rounded-xl border border-[#82C7A5]/20 bg-[#82C7A5]/10 p-4">
+            <div className="text-[11px] uppercase tracking-[0.18em] text-[#82C7A5]/80">Primary Action</div>
+            <div className="mt-1 text-sm font-semibold text-white">{primaryAction}</div>
           </div>
         </section>
 
@@ -795,6 +802,23 @@ function DeskHeadScreen({ onOpenAction, onOpenRun }) {
         </section>
 
         <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+          <PaneTitle>Execution Order</PaneTitle>
+          <div className="space-y-2">
+            {executionOrder.map((item, index) => (
+              <div key={`${item.label}-${index}`} className="rounded-lg border border-white/10 bg-black/10 p-3 text-sm text-white/70">
+                <div className="flex gap-3">
+                  <span className="font-mono text-[#82C7A5]">{index + 1}</span>
+                  <div>
+                    <div className="text-white">{item.label}</div>
+                    <div className="mt-1 text-xs text-white/45">{item.detail}</div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
           <PaneTitle>Suggested Trades</PaneTitle>
           <div className="space-y-2">
             {(selected?.suggestedTrades || []).map((trade) => (
@@ -850,9 +874,10 @@ function buildDeskActionRow(row, allRows = []) {
     { type: 'Sensitivity', score: cs01Score * 0.95 },
   ].sort((a, b) => b.score - a.score)[0]?.type || 'Exposure'
 
-  const status = hedgeRatio < 0.55 || hedgeGapScore > 0.25 ? 'FLAG' : hedgeRatio < targetHedgeRatio ? 'MONITOR' : 'OK'
-  const confidenceScore = hedgeGapScore * 0.45 + cs01Score * 0.30 + epeScore * 0.15 + spreadScore * 0.10
-  const actionConfidence = confidenceScore >= 0.62 ? 'HIGH' : confidenceScore >= 0.42 ? 'MEDIUM' : 'LOW'
+  const materialityScore = cs01Score * 0.40 + epeScore * 0.35 + spreadScore * 0.25
+  const status = materialityScore >= 0.82 ? 'FLAG' : materialityScore >= 0.62 ? 'MONITOR' : 'OK'
+  const confidenceScore = materialityScore * 0.55 + hedgeGapScore * 0.25 + cs01Score * 0.20
+  const actionConfidence = status === 'OK' ? 'LOW' : confidenceScore >= 0.78 ? 'HIGH' : confidenceScore >= 0.58 ? 'MEDIUM' : 'LOW'
   const cdsNotional = actionNotional(hedgeGap, spreadBps, lgd)
   const irsNotional = actionNotional(ir01 * 65, spreadBps, lgd)
 
@@ -874,6 +899,7 @@ function buildDeskActionRow(row, allRows = []) {
     ir01,
     status,
     actionConfidence,
+    materialityScore,
     primaryDriver,
     recommendedAction,
     suggestedTrades,
@@ -884,6 +910,50 @@ function buildDeskActionRow(row, allRows = []) {
     postActionNetCva,
     explanation: `${primaryDriver}-led action: ${row.driver}. Hedge ratio is ${formatPercent(hedgeRatio)} against a 70% target, leaving a ${formatCompactCurrency(hedgeGap, row.currency)} gap. The recommendation is driven by ${formatCompactCurrency(row.cs01, row.currency)} CS01, ${formatCompactCurrency(ir01, row.currency)} IR01 and peak EPE of ${formatCompactCurrency(row.peak_epe, row.currency)} at ${tenor}.`,
   }
+}
+
+
+function buildPortfolioPrimaryAction(rows = []) {
+  const flags = rows.filter((row) => row.status === 'FLAG')
+  const monitors = rows.filter((row) => row.status === 'MONITOR')
+  const actionSet = flags.length ? flags : monitors
+  if (!actionSet.length) return 'No immediate portfolio hedge action; maintain monitoring and preserve current hedge posture.'
+
+  const topNames = actionSet.slice(0, 3).map((row) => row.counterparty?.name).filter(Boolean).join(', ')
+  const dominantDriver = mostCommon(actionSet.map((row) => row.primaryDriver))
+
+  if (dominantDriver === 'Credit') return `Increase front-end credit hedging across ${topNames}.`
+  if (dominantDriver === 'Sensitivity') return `Reduce concentrated CS01 through IRS compression across ${topNames}.`
+  return `Rebalance front-end exposure before adding residual CDS protection across ${topNames}.`
+}
+
+function buildExecutionOrder(rows = []) {
+  const flagged = rows.filter((row) => row.status === 'FLAG')
+  const monitor = rows.filter((row) => row.status === 'MONITOR')
+  const exposureNames = flagged.filter((row) => row.primaryDriver === 'Exposure').slice(0, 2).map((row) => row.counterparty?.name).filter(Boolean)
+  const creditNames = flagged.filter((row) => row.primaryDriver === 'Credit').slice(0, 2).map((row) => row.counterparty?.name).filter(Boolean)
+  const sensitivityNames = [...flagged, ...monitor].filter((row) => row.primaryDriver === 'Sensitivity').slice(0, 2).map((row) => row.counterparty?.name).filter(Boolean)
+  const fallback = flagged.slice(0, 2).map((row) => row.counterparty?.name).filter(Boolean)
+
+  return [
+    {
+      label: 'Rebalance exposure concentration',
+      detail: `${(exposureNames.length ? exposureNames : fallback).join(', ') || 'No immediate names'} before buying additional protection`,
+    },
+    {
+      label: 'Add residual CDS protection',
+      detail: `${(creditNames.length ? creditNames : fallback).join(', ') || 'No immediate names'} after exposure rebalance`,
+    },
+    {
+      label: 'Compress CS01-heavy IRS risk',
+      detail: `${(sensitivityNames.length ? sensitivityNames : monitor.slice(0, 2).map((row) => row.counterparty?.name).filter(Boolean)).join(', ') || 'Monitor only'} as second-order clean-up`,
+    },
+  ]
+}
+
+function mostCommon(values = []) {
+  const counts = values.reduce((acc, value) => ({ ...acc, [value]: (acc[value] || 0) + 1 }), {})
+  return Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0]
 }
 
 function buildRecommendedAction(status, primaryDriver, tenor, cdsNotional, irsNotional) {
