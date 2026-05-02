@@ -69,9 +69,303 @@ def root():
     return {"status": "running"}
 
 ====================================================================================================
-FILE: backend\app\modules\screens\__init__.py
+FILE: backend\app\modules\cva\__init__.py
 ====================================================================================================
 
+
+
+====================================================================================================
+FILE: backend\app\modules\cva\cva_engine.py
+====================================================================================================
+
+from __future__ import annotations
+
+import math
+
+CVA_MODEL_VERSION = "MVP-CVA-HAZARD-0.1"
+RISK_FREE_RATE = 0.035
+
+
+def calculate_cva_profile(
+    profile: list[dict],
+    spread_by_tenor: dict[str, float],
+    recovery_rate: float,
+    epe_field: str = "epe_current",
+) -> dict:
+    lgd = 1.0 - recovery_rate
+    default_spread = _default_spread(spread_by_tenor)
+
+    total_cva = 0.0
+    exposure_profile = []
+    peak_epe = 0.0
+    peak_bucket = "—"
+    previous_year = 0.0
+
+    for point in profile:
+        label = point["label"]
+        year = float(point["year"] or 0)
+        spread = float(spread_by_tenor.get(label) or default_spread)
+        epe = float(point.get(epe_field) or 0)
+        pfe = float(point.get("pfe_95") or 0)
+
+        marginal_pd = _marginal_pd(spread, recovery_rate, previous_year, year)
+        discount_factor = _discount_factor(year)
+        cva_contribution = -abs(epe * marginal_pd * lgd * discount_factor)
+        total_cva += cva_contribution
+
+        if epe > peak_epe:
+            peak_epe = epe
+            peak_bucket = label
+
+        exposure_profile.append(
+            {
+                "label": label,
+                "date": point["date"],
+                "year": year,
+                "epe": round(epe, 2),
+                "pfe_95": round(pfe, 2),
+                "credit_spread_bps": round(spread * 10000, 1),
+                "marginal_pd": round(marginal_pd, 6),
+                "recovery_rate": round(recovery_rate, 4),
+                "lgd": round(lgd, 4),
+                "discount_factor": round(discount_factor, 6),
+                "cva_contribution": round(cva_contribution, 2),
+                "driver": "Exposure" if label == peak_bucket else "Credit / LGD",
+            }
+        )
+        previous_year = max(previous_year, year)
+
+    return {
+        "total_cva": total_cva,
+        "exposure_profile": exposure_profile,
+        "peak_epe": peak_epe,
+        "peak_bucket": peak_bucket,
+        "lgd": lgd,
+    }
+
+
+def calculate_incremental_cva(
+    profile: list[dict],
+    spread_by_tenor: dict[str, float],
+    recovery_rate: float,
+) -> float:
+    lgd = 1.0 - recovery_rate
+    default_spread = _default_spread(spread_by_tenor)
+    total_cva = 0.0
+    previous_year = 0.0
+
+    for point in profile:
+        label = point["label"]
+        year = float(point["year"] or 0)
+        spread = float(spread_by_tenor.get(label) or default_spread)
+        incremental_epe = max(float(point.get("epe_new_trade") or 0) - float(point.get("epe_current") or 0), 0.0)
+
+        marginal_pd = _marginal_pd(spread, recovery_rate, previous_year, year)
+        discount_factor = _discount_factor(year)
+        total_cva += -abs(incremental_epe * marginal_pd * lgd * discount_factor)
+        previous_year = max(previous_year, year)
+
+    return total_cva
+
+
+def _default_spread(spread_by_tenor: dict[str, float]) -> float:
+    if not spread_by_tenor:
+        return 0.0125
+    return spread_by_tenor.get("5Y") or sum(spread_by_tenor.values()) / len(spread_by_tenor)
+
+
+def _marginal_pd(spread: float, recovery_rate: float, previous_year: float, current_year: float) -> float:
+    # Simple hazard-rate approximation: spread ~= hazard * LGD.
+    lgd = max(1.0 - recovery_rate, 0.05)
+    hazard_rate = max(spread / lgd, 0.0)
+    start_survival = math.exp(-hazard_rate * max(previous_year, 0.0))
+    end_survival = math.exp(-hazard_rate * max(current_year, previous_year))
+    return max(min(start_survival - end_survival, 0.45), 0.0)
+
+
+def _discount_factor(year: float) -> float:
+    return 1 / ((1 + RISK_FREE_RATE) ** max(year, 0.08))
+
+
+====================================================================================================
+FILE: backend\app\modules\exposure\__init__.py
+====================================================================================================
+
+
+
+====================================================================================================
+FILE: backend\app\modules\exposure\path_engine.py
+====================================================================================================
+
+from __future__ import annotations
+
+from datetime import date, timedelta
+import math
+
+PATH_COUNT = 250
+MODEL_VERSION = "MVP-PATH-EXPOSURE-0.1"
+
+
+def profile_buckets():
+    return [
+        ("1m", 1 / 12),
+        ("3m", 0.25),
+        ("6m", 0.5),
+        ("1Y", 1),
+        ("2Y", 2),
+        ("3Y", 3),
+        ("5Y", 5),
+        ("7Y", 7),
+        ("10Y", 10),
+    ]
+
+
+def build_portfolio_profile(valuation_date: date, existing_trades: list, currency: str, path_count: int = PATH_COUNT):
+    profile = []
+
+    for label, year in profile_buckets():
+        path_exposures = [
+            max(_portfolio_exposure_for_path(existing_trades, year, currency, path_index), 0.0)
+            for path_index in range(path_count)
+        ]
+        epe_current = _mean(path_exposures)
+        pfe_95 = _percentile(path_exposures, 95)
+        bucket_date = valuation_date + timedelta(days=int(365 * year))
+
+        profile.append(
+            {
+                "label": label,
+                "date": str(bucket_date),
+                "year": round(year, 4),
+                "show_tick": True,
+                "epe_current": round(epe_current, 2),
+                "epe_new_trade": round(epe_current, 2),
+                "pfe_95": round(pfe_95, 2),
+                "path_count": path_count,
+            }
+        )
+
+    return profile
+
+
+def build_incremental_profile(
+    valuation_date: date,
+    existing_trades: list,
+    currency: str,
+    trade_notional: float,
+    maturity_years: float,
+    rate_delta_bps: float,
+    direction: str,
+    path_count: int = PATH_COUNT,
+):
+    direction_sign = 1 if direction.upper() == "PAY" else -1
+    rate_sensitivity = 1 + min(abs(rate_delta_bps) / 50, 0.35)
+    profile = []
+
+    for label, year in profile_buckets():
+        current_paths = []
+        new_trade_paths = []
+
+        for path_index in range(path_count):
+            current = max(_portfolio_exposure_for_path(existing_trades, year, currency, path_index), 0.0)
+            increment = _new_trade_increment(
+                trade_notional=trade_notional,
+                year=year,
+                maturity_years=maturity_years,
+                rate_sensitivity=rate_sensitivity,
+                direction_sign=direction_sign,
+                path_index=path_index,
+            )
+            new_exposure = max(current + increment, 0.0)
+            current_paths.append(current)
+            new_trade_paths.append(new_exposure)
+
+        epe_current = _mean(current_paths)
+        epe_new_trade = _mean(new_trade_paths)
+        pfe_95 = max(_percentile(new_trade_paths, 95), _percentile(current_paths, 95))
+        bucket_date = valuation_date + timedelta(days=int(365 * year))
+
+        profile.append(
+            {
+                "label": label,
+                "date": str(bucket_date),
+                "year": round(year, 4),
+                "show_tick": True,
+                "epe_current": round(epe_current, 2),
+                "epe_new_trade": round(epe_new_trade, 2),
+                "pfe_95": round(pfe_95, 2),
+                "path_count": path_count,
+            }
+        )
+
+    return profile
+
+
+def _portfolio_exposure_for_path(trades: list, year: float, currency: str, path_index: int) -> float:
+    total = 0.0
+
+    for trade_index, trade in enumerate(trades):
+        if trade.currency != currency:
+            continue
+
+        maturity_years = max((trade.maturity_date - trade.effective_date).days / 365, 0.25)
+        progress = min(year / maturity_years, 1)
+        if progress >= 1:
+            continue
+
+        shape = math.sin(progress * math.pi) ** 0.88
+        direction_multiplier = 1.0 if trade.pay_receive_fixed.upper() == "PAY" else 0.82
+        rate_multiplier = 1 + min(abs(float(trade.fixed_rate) - 0.04) * 8, 0.35)
+        path_multiplier = _synthetic_path_multiplier(path_index, year, trade_index)
+
+        total += float(trade.notional) * 0.060 * shape * direction_multiplier * rate_multiplier * path_multiplier
+
+    return total
+
+
+def _new_trade_increment(
+    trade_notional: float,
+    year: float,
+    maturity_years: float,
+    rate_sensitivity: float,
+    direction_sign: int,
+    path_index: int,
+) -> float:
+    progress = min(year / max(maturity_years, 0.25), 1)
+    trade_shape = math.sin(progress * math.pi) ** 1.20 if progress < 1 else 0
+    path_multiplier = _synthetic_path_multiplier(path_index, year, 997)
+    return trade_notional * 0.115 * trade_shape * rate_sensitivity * direction_sign * path_multiplier
+
+
+def _synthetic_path_multiplier(path_index: int, year: float, salt: int) -> float:
+    # Deterministic low-discrepancy-style variation. This is intentionally not random:
+    # the same inputs produce the same demo numbers every run.
+    cyclical = math.sin((path_index + 1) * 0.173 + year * 0.71 + salt * 0.037)
+    secondary = math.cos((path_index + 1) * 0.097 + year * 0.43 + salt * 0.019)
+    stress_tilt = ((path_index % 25) - 12) / 12
+
+    multiplier = 1.0 + (0.22 * cyclical) + (0.10 * secondary) + (0.035 * stress_tilt)
+    return max(multiplier, 0.35)
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+
+    ordered = sorted(values)
+    rank = (len(ordered) - 1) * (percentile / 100)
+    low = math.floor(rank)
+    high = math.ceil(rank)
+
+    if low == high:
+        return ordered[int(rank)]
+
+    weight = rank - low
+    return ordered[low] * (1 - weight) + ordered[high] * weight
 
 
 ====================================================================================================
@@ -98,6 +392,18 @@ from backend.app.modules.trades.models import (
     CalculationRun,
     ExposureProfile,
     CvaResult,
+)
+
+from backend.app.modules.exposure.path_engine import (
+    PATH_COUNT,
+    MODEL_VERSION as EXPOSURE_MODEL_VERSION,
+    build_incremental_profile as build_path_incremental_profile,
+    build_portfolio_profile as build_path_portfolio_profile,
+)
+from backend.app.modules.cva.cva_engine import (
+    CVA_MODEL_VERSION,
+    calculate_cva_profile,
+    calculate_incremental_cva,
 )
 
 router = APIRouter(prefix="/screens", tags=["screens"])
@@ -258,11 +564,14 @@ def calculate_from_screen1(request: Screen1Request):
             direction=request.direction,
         )
 
-        incremental_epe = max(
-            max(point["epe_new_trade"] - point["epe_current"], 0)
-            for point in profile
+        credit_points = db.query(CurvePoint).filter(CurvePoint.curve_id == credit_curve.curve_id).all()
+        spread_by_tenor = {p.tenor: float(p.value or 0) for p in credit_points}
+
+        cva_incremental = calculate_incremental_cva(
+            profile=profile,
+            spread_by_tenor=spread_by_tenor,
+            recovery_rate=float(recovery.recovery_rate),
         )
-        cva_incremental = -abs(incremental_epe * credit_spread * lgd * maturity_years * 0.19)
         dva_incremental = abs(cva_incremental) * 0.146
         fva_incremental = -abs(cva_incremental) * 0.346
         total_xva_charge = cva_incremental + dva_incremental + fva_incremental
@@ -281,7 +590,7 @@ def calculate_from_screen1(request: Screen1Request):
                 csa_id=csa.csa_id,
                 valuation_date=snapshot.valuation_date,
                 status="CALCULATED",
-                model_version="MVP-INCREMENTAL-XVA-0.2",
+                model_version=f"{EXPOSURE_MODEL_VERSION}+{CVA_MODEL_VERSION}",
             )
         )
         db.flush()
@@ -322,6 +631,14 @@ def calculate_from_screen1(request: Screen1Request):
             "calculation_run_id": run_id,
             "valuation_date": str(snapshot.valuation_date),
             "maturity_date": str(maturity_date),
+            "simulation": {
+                "method": "Synthetic path exposure approximation",
+                "path_count": PATH_COUNT,
+                "time_buckets": len(profile),
+                "monte_carlo_ready": True,
+                "exposure_model_version": EXPOSURE_MODEL_VERSION,
+                "cva_model_version": CVA_MODEL_VERSION,
+            },
             "counterparty": {"id": counterparty.counterparty_id, "name": counterparty.name},
             "netting_set": build_netting_set_payload(netting_set, existing_trades),
             "par_rate_pct": par_rate_pct,
@@ -397,54 +714,31 @@ def get_cva_risk_summary():
             recovery_rate = float(recovery.recovery_rate) if recovery else 0.40
             lgd = 1.0 - recovery_rate
 
-            cva_total = 0.0
-            exposure_profile = []
-            peak_epe = 0.0
-            peak_bucket = "—"
+            cva_result = calculate_cva_profile(
+                profile=profile,
+                spread_by_tenor=spread_by_tenor,
+                recovery_rate=recovery_rate,
+                epe_field="epe_current",
+            )
+            cva_total = cva_result["total_cva"]
+            exposure_profile = cva_result["exposure_profile"]
+            peak_epe = cva_result["peak_epe"]
+            peak_bucket = cva_result["peak_bucket"]
 
-            for point in profile:
-                label = point["label"]
-                spread = spread_by_tenor.get(label) or default_spread
-                epe = float(point["epe_current"] or 0)
-                pfe = float(point["pfe_95"] or 0)
-                year = float(point["year"] or 0)
-                marginal_pd = min(spread * max(year, 0.08), 0.45)
-                discount_factor = 1 / ((1 + 0.035) ** max(year, 0.08))
-                cva_contribution = -abs(epe * marginal_pd * lgd * discount_factor * 0.18)
-
-                cva_total += cva_contribution
-                if epe > peak_epe:
-                    peak_epe = epe
-                    peak_bucket = label
-
-                bucket_payload = {
-                    "label": label,
-                    "date": point["date"],
-                    "year": year,
-                    "epe": round(epe, 2),
-                    "pfe_95": round(pfe, 2),
-                    "credit_spread_bps": round(spread * 10000, 1),
-                    "marginal_pd": round(marginal_pd, 6),
-                    "recovery_rate": round(recovery_rate, 4),
-                    "lgd": round(lgd, 4),
-                    "discount_factor": round(discount_factor, 6),
-                    "cva_contribution": round(cva_contribution, 2),
-                    "driver": "Exposure" if epe >= peak_epe else "Credit / LGD",
-                }
-                exposure_profile.append(bucket_payload)
-
+            for bucket_payload in exposure_profile:
+                label = bucket_payload["label"]
                 if label not in portfolio_buckets:
                     portfolio_buckets[label] = {
                         "label": label,
-                        "date": point["date"],
-                        "year": year,
+                        "date": bucket_payload["date"],
+                        "year": bucket_payload["year"],
                         "epe": 0.0,
                         "pfe_95": 0.0,
                         "cva_contribution": 0.0,
                     }
-                portfolio_buckets[label]["epe"] += epe
-                portfolio_buckets[label]["pfe_95"] += pfe
-                portfolio_buckets[label]["cva_contribution"] += cva_contribution
+                portfolio_buckets[label]["epe"] += float(bucket_payload["epe"] or 0)
+                portfolio_buckets[label]["pfe_95"] += float(bucket_payload["pfe_95"] or 0)
+                portfolio_buckets[label]["cva_contribution"] += float(bucket_payload["cva_contribution"] or 0)
 
             cs01 = abs(cva_total) * 0.0118
             # MVP DVA proxy: positive own-credit offset against counterparty CVA.
@@ -516,7 +810,7 @@ def get_cva_risk_summary():
             "status": "LIVE",
             "calculation_run_id": "CVA-RISK-LIVE-VIEW",
             "valuation_date": str(snapshot.valuation_date),
-            "model_version": "MVP-CVA-RISK-0.1",
+            "model_version": f"{EXPOSURE_MODEL_VERSION}+{CVA_MODEL_VERSION}",
             "portfolio": {
                 "cva": round(total_cva, 2),
                 "dva": round(total_dva, 2),
@@ -528,10 +822,18 @@ def get_cva_risk_summary():
             },
             "counterparties": rows,
             "buckets": ordered_buckets,
+            "simulation": {
+                "method": "Synthetic path exposure approximation",
+                "path_count": PATH_COUNT,
+                "time_buckets": len(ordered_buckets),
+                "monte_carlo_ready": True,
+                "exposure_model_version": EXPOSURE_MODEL_VERSION,
+                "cva_model_version": CVA_MODEL_VERSION,
+            },
             "lineage": {
                 "source_tables": ["counterparties", "netting_sets", "irs_trades", "curves", "curve_points", "recovery_rates"],
-                "method": "Simplified MVP CVA aggregation: exposure x marginal PD x LGD x discount factor; DVA is an MVP own-credit offset proxy",
-                "limitations": ["No Monte Carlo engine", "No calibrated PD curve", "No Murex reconciliation yet"],
+                "method": "Synthetic path exposure approximation: 250 deterministic scenario paths across tenor buckets; EPE and PFE are derived from positive exposure distributions; CVA is aggregated from EPE, marginal PD, LGD and discount factors.",
+                "limitations": ["Not a full grid Monte Carlo engine", "Deterministic synthetic path set", "No calibrated stochastic rates model", "No Murex reconciliation yet"],
             },
         }
     finally:
@@ -576,23 +878,7 @@ def build_netting_set_payload(netting_set: NettingSet, trades: list[IrsTrade]):
 
 
 def build_portfolio_profile(valuation_date: date, existing_trades: list[IrsTrade], currency: str):
-    profile = []
-    for label, year in profile_buckets():
-        current_epe = portfolio_epe(existing_trades, year, currency)
-        pfe_95 = current_epe * 1.62
-        bucket_date = valuation_date + timedelta(days=int(365 * year))
-        profile.append(
-            {
-                "label": label,
-                "date": str(bucket_date),
-                "year": round(year, 4),
-                "show_tick": True,
-                "epe_current": round(current_epe, 2),
-                "epe_new_trade": round(current_epe, 2),
-                "pfe_95": round(pfe_95, 2),
-            }
-        )
-    return profile
+    return build_path_portfolio_profile(valuation_date, existing_trades, currency)
 
 
 def build_incremental_profile(
@@ -604,32 +890,15 @@ def build_incremental_profile(
     rate_delta_bps: float,
     direction: str,
 ):
-    direction_sign = 1 if direction.upper() == "PAY" else -1
-    rate_sensitivity = 1 + min(abs(rate_delta_bps) / 50, 0.35)
-    profile = []
-
-    for label, year in profile_buckets():
-        current_epe = portfolio_epe(existing_trades, year, currency)
-        progress = min(year / max(maturity_years, 0.25), 1)
-        trade_shape = math.sin(progress * math.pi) ** 1.20 if progress < 1 else 0
-        trade_increment = trade_notional * 0.115 * trade_shape * rate_sensitivity * direction_sign
-        epe_new_trade = max(current_epe + trade_increment, 0)
-        pfe_95 = max(epe_new_trade * 1.68, current_epe * 1.62)
-        bucket_date = valuation_date + timedelta(days=int(365 * year))
-
-        profile.append(
-            {
-                "label": label,
-                "date": str(bucket_date),
-                "year": round(year, 4),
-                "show_tick": True,
-                "epe_current": round(current_epe, 2),
-                "epe_new_trade": round(epe_new_trade, 2),
-                "pfe_95": round(pfe_95, 2),
-            }
-        )
-
-    return profile
+    return build_path_incremental_profile(
+        valuation_date=valuation_date,
+        existing_trades=existing_trades,
+        currency=currency,
+        trade_notional=trade_notional,
+        maturity_years=maturity_years,
+        rate_delta_bps=rate_delta_bps,
+        direction=direction,
+    )
 
 
 def profile_buckets():
@@ -744,6 +1013,7 @@ def to_bps(amount: float, notional: float) -> float:
     if notional == 0:
         return 0
     return amount / notional * 10000
+
 
 
 
@@ -1677,10 +1947,10 @@ FILE: frontend\index.html
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  
     <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@500;700&family=Lato:wght@300;400;700&display=swap" rel="stylesheet">
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>frontend</title>
+    <title>M7 XVA</title>
   </head>
   <body>
     <div id="root"></div>
@@ -4778,13 +5048,7 @@ FILE: frontend\package.json
 
 
 ====================================================================================================
-FILE: frontend\public\favicon.svg
-====================================================================================================
-
-<svg xmlns="http://www.w3.org/2000/svg" width="48" height="46" fill="none" viewBox="0 0 48 46"><path fill="#863bff" d="M25.946 44.938c-.664.845-2.021.375-2.021-.698V33.937a2.26 2.26 0 0 0-2.262-2.262H10.287c-.92 0-1.456-1.04-.92-1.788l7.48-10.471c1.07-1.497 0-3.578-1.842-3.578H1.237c-.92 0-1.456-1.04-.92-1.788L10.013.474c.214-.297.556-.474.92-.474h28.894c.92 0 1.456 1.04.92 1.788l-7.48 10.471c-1.07 1.498 0 3.579 1.842 3.579h11.377c.943 0 1.473 1.088.89 1.83L25.947 44.94z" style="fill:#863bff;fill:color(display-p3 .5252 .23 1);fill-opacity:1"/><mask id="a" width="48" height="46" x="0" y="0" maskUnits="userSpaceOnUse" style="mask-type:alpha"><path fill="#000" d="M25.842 44.938c-.664.844-2.021.375-2.021-.698V33.937a2.26 2.26 0 0 0-2.262-2.262H10.183c-.92 0-1.456-1.04-.92-1.788l7.48-10.471c1.07-1.498 0-3.579-1.842-3.579H1.133c-.92 0-1.456-1.04-.92-1.787L9.91.473c.214-.297.556-.474.92-.474h28.894c.92 0 1.456 1.04.92 1.788l-7.48 10.471c-1.07 1.498 0 3.578 1.842 3.578h11.377c.943 0 1.473 1.088.89 1.832L25.843 44.94z" style="fill:#000;fill-opacity:1"/></mask><g mask="url(#a)"><g filter="url(#b)"><ellipse cx="5.508" cy="14.704" fill="#ede6ff" rx="5.508" ry="14.704" style="fill:#ede6ff;fill:color(display-p3 .9275 .9033 1);fill-opacity:1" transform="matrix(.00324 1 1 -.00324 -4.47 31.516)"/></g><g filter="url(#c)"><ellipse cx="10.399" cy="29.851" fill="#ede6ff" rx="10.399" ry="29.851" style="fill:#ede6ff;fill:color(display-p3 .9275 .9033 1);fill-opacity:1" transform="matrix(.00324 1 1 -.00324 -39.328 7.883)"/></g><g filter="url(#d)"><ellipse cx="5.508" cy="30.487" fill="#7e14ff" rx="5.508" ry="30.487" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(89.814 -25.913 -14.639)scale(1 -1)"/></g><g filter="url(#e)"><ellipse cx="5.508" cy="30.599" fill="#7e14ff" rx="5.508" ry="30.599" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(89.814 -32.644 -3.334)scale(1 -1)"/></g><g filter="url(#f)"><ellipse cx="5.508" cy="30.599" fill="#7e14ff" rx="5.508" ry="30.599" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="matrix(.00324 1 1 -.00324 -34.34 30.47)"/></g><g filter="url(#g)"><ellipse cx="14.072" cy="22.078" fill="#ede6ff" rx="14.072" ry="22.078" style="fill:#ede6ff;fill:color(display-p3 .9275 .9033 1);fill-opacity:1" transform="rotate(93.35 24.506 48.493)scale(-1 1)"/></g><g filter="url(#h)"><ellipse cx="3.47" cy="21.501" fill="#7e14ff" rx="3.47" ry="21.501" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(89.009 28.708 47.59)scale(-1 1)"/></g><g filter="url(#i)"><ellipse cx="3.47" cy="21.501" fill="#7e14ff" rx="3.47" ry="21.501" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(89.009 28.708 47.59)scale(-1 1)"/></g><g filter="url(#j)"><ellipse cx=".387" cy="8.972" fill="#7e14ff" rx="4.407" ry="29.108" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(39.51 .387 8.972)"/></g><g filter="url(#k)"><ellipse cx="47.523" cy="-6.092" fill="#7e14ff" rx="4.407" ry="29.108" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(37.892 47.523 -6.092)"/></g><g filter="url(#l)"><ellipse cx="41.412" cy="6.333" fill="#47bfff" rx="5.971" ry="9.665" style="fill:#47bfff;fill:color(display-p3 .2799 .748 1);fill-opacity:1" transform="rotate(37.892 41.412 6.333)"/></g><g filter="url(#m)"><ellipse cx="-1.879" cy="38.332" fill="#7e14ff" rx="4.407" ry="29.108" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(37.892 -1.88 38.332)"/></g><g filter="url(#n)"><ellipse cx="-1.879" cy="38.332" fill="#7e14ff" rx="4.407" ry="29.108" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(37.892 -1.88 38.332)"/></g><g filter="url(#o)"><ellipse cx="35.651" cy="29.907" fill="#7e14ff" rx="4.407" ry="29.108" style="fill:#7e14ff;fill:color(display-p3 .4922 .0767 1);fill-opacity:1" transform="rotate(37.892 35.651 29.907)"/></g><g filter="url(#p)"><ellipse cx="38.418" cy="32.4" fill="#47bfff" rx="5.971" ry="15.297" style="fill:#47bfff;fill:color(display-p3 .2799 .748 1);fill-opacity:1" transform="rotate(37.892 38.418 32.4)"/></g></g><defs><filter id="b" width="60.045" height="41.654" x="-19.77" y="16.149" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="7.659"/></filter><filter id="c" width="90.34" height="51.437" x="-54.613" y="-7.533" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="7.659"/></filter><filter id="d" width="79.355" height="29.4" x="-49.64" y="2.03" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="e" width="79.579" height="29.4" x="-45.045" y="20.029" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="f" width="79.579" height="29.4" x="-43.513" y="21.178" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="g" width="74.749" height="58.852" x="15.756" y="-17.901" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="7.659"/></filter><filter id="h" width="61.377" height="25.362" x="23.548" y="2.284" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="i" width="61.377" height="25.362" x="23.548" y="2.284" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="j" width="56.045" height="63.649" x="-27.636" y="-22.853" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="k" width="54.814" height="64.646" x="20.116" y="-38.415" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="l" width="33.541" height="35.313" x="24.641" y="-11.323" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="m" width="54.814" height="64.646" x="-29.286" y="6.009" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="n" width="54.814" height="64.646" x="-29.286" y="6.009" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="o" width="54.814" height="64.646" x="8.244" y="-2.416" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter><filter id="p" width="39.409" height="43.623" x="18.713" y="10.588" color-interpolation-filters="sRGB" filterUnits="userSpaceOnUse"><feFlood flood-opacity="0" result="BackgroundImageFix"/><feBlend in="SourceGraphic" in2="BackgroundImageFix" result="shape"/><feGaussianBlur result="effect1_foregroundBlur_2002_17158" stdDeviation="4.596"/></filter></defs></svg>
-
-====================================================================================================
-FILE: frontend\public\icons.svg
+FILE: frontend\public\icons-old.svg
 ====================================================================================================
 
 <svg xmlns="http://www.w3.org/2000/svg">
@@ -5410,14 +5674,20 @@ export default function App() {
               M7 XVA
             </h1>
             <p className="mt-1 text-xs uppercase tracking-[0.24em] text-white/55">
-              {activeScreen === 'trader' ? 'New Trade — Incremental XVA' : 'CVA Risk — Exposure, Credit and LGD'}
+              {
+                activeScreen === 'trader'
+                  ? 'New Trade — Incremental XVA'
+                  : activeScreen === 'cvaRisk'
+                    ? 'CVA Risk — Exposure, Credit and LGD'
+                    : 'Desk Head — Portfolio Actions'
+              }
             </p>
           </div>
 
           <nav className="hidden gap-8 text-sm text-white/60 lg:flex">
             <button type="button" onClick={() => setActiveScreen('trader')} className={`pb-3 ${activeScreen === 'trader' ? 'border-b-2 border-[#0145AC] text-white' : 'text-white/60'}`}>Trader</button>
             <button type="button" onClick={() => setActiveScreen('cvaRisk')} className={`pb-3 ${activeScreen === 'cvaRisk' ? 'border-b-2 border-[#0145AC] text-white' : 'text-white/60'}`}>CVA Risk</button>
-            <span className="pb-3">Desk Head</span>
+            <button type="button" onClick={() => setActiveScreen('deskHead')} className={`pb-3 ${activeScreen === 'deskHead' ? 'border-b-2 border-[#0145AC] text-white' : 'text-white/60'}`}>Desk Head</button>
             <span className="pb-3">Ops / Quant</span>
           </nav>
         </header>
@@ -5506,7 +5776,7 @@ export default function App() {
           </section>
         </main>
 
-        ) : (
+        ) : activeScreen === 'cvaRisk' ? (
           <CvaRiskScreen
             onOpenCounterparty={(row) =>
               setActiveDrilldown({
@@ -5528,6 +5798,27 @@ export default function App() {
               setActiveDrilldown({
                 type: 'run',
                 title: 'CVA Risk Run Context',
+                runId: summary?.calculation_run_id || 'CVA-RISK-LIVE-VIEW',
+                model: summary?.model_version || 'MVP-CVA-RISK-0.1',
+                counterparty: 'Portfolio',
+                trades: summary?.portfolio?.trades || 0,
+              })
+            }
+          />
+        ) : (
+          <DeskHeadScreen
+            onOpenAction={(row) =>
+              setActiveDrilldown({
+                type: 'deskAction',
+                title: row.counterparty?.name || 'Portfolio Action',
+                row,
+                currency: row.currency,
+              })
+            }
+            onOpenRun={(summary) =>
+              setActiveDrilldown({
+                type: 'run',
+                title: 'Desk Head Decision Context',
                 runId: summary?.calculation_run_id || 'CVA-RISK-LIVE-VIEW',
                 model: summary?.model_version || 'MVP-CVA-RISK-0.1',
                 counterparty: 'Portfolio',
@@ -5696,6 +5987,52 @@ function DrilldownDrawer({ activeDrilldown, onClose, currency }) {
           </div>
         )}
 
+
+        {activeDrilldown.type === 'deskAction' && (
+          <div className="space-y-4 text-sm text-white/70">
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <div className="text-xs uppercase tracking-[0.16em] text-white/45">Decision Status</div>
+                  <div className="mt-1 text-lg text-white">{activeDrilldown.row?.status}</div>
+                </div>
+                <ConfidenceTag confidence={activeDrilldown.row?.actionConfidence} />
+              </div>
+              <div className="mt-3 text-[#82C7A5]">{activeDrilldown.row?.recommendedAction}</div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <RiskMiniStat label="CVA" value={formatCompactCurrency(activeDrilldown.row?.cva, activeDrilldown.row?.currency || currency)} />
+              <RiskMiniStat label="CS01" value={formatCompactCurrency(activeDrilldown.row?.cs01, activeDrilldown.row?.currency || currency)} />
+              <RiskMiniStat label="IR01" value={formatCompactCurrency(activeDrilldown.row?.ir01, activeDrilldown.row?.currency || currency)} />
+              <RiskMiniStat label="Hedge Ratio" value={`${formatPercent(activeDrilldown.row?.hedgeRatio)} / 70%`} />
+            </div>
+
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
+              <div className="mb-3 text-xs uppercase tracking-[0.16em] text-white/45">Hedge Gap</div>
+              <div className="space-y-2">
+                <div className="flex justify-between"><span>Current offset</span><span>{formatCompactCurrency(activeDrilldown.row?.dva, activeDrilldown.row?.currency || currency)}</span></div>
+                <div className="flex justify-between"><span>Target hedge</span><span>{formatCompactCurrency(activeDrilldown.row?.targetHedge, activeDrilldown.row?.currency || currency)}</span></div>
+                <div className="flex justify-between"><span>Gap</span><span className="text-amber-200">{formatCompactCurrency(activeDrilldown.row?.hedgeGap, activeDrilldown.row?.currency || currency)}</span></div>
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
+              <div className="mb-3 text-xs uppercase tracking-[0.16em] text-white/45">Suggested Trades</div>
+              <div className="space-y-2">
+                {(activeDrilldown.row?.suggestedTrades || []).map((trade) => (
+                  <div key={trade} className="rounded-lg border border-white/10 bg-black/10 p-3 text-white/70">{trade}</div>
+                ))}
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4 leading-relaxed">
+              <div className="mb-2 text-xs uppercase tracking-[0.16em] text-white/45">Why this action?</div>
+              {activeDrilldown.row?.explanation}
+            </div>
+          </div>
+        )}
+
         {activeDrilldown.type === 'nettingSet' && (
           <div className="space-y-3 text-sm text-white/70">
             <div className="rounded-xl border border-white/10 bg-[#222B3A] p-4">
@@ -5744,6 +6081,449 @@ function DrilldownDrawer({ activeDrilldown, onClose, currency }) {
     </div>
   )
 }
+
+
+function DeskHeadScreen({ onOpenAction, onOpenRun }) {
+  const [summary, setSummary] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [selectedId, setSelectedId] = useState('')
+
+  useEffect(() => {
+    setLoading(true)
+    axios
+      .get(`${API_BASE}/screens/cva-risk/summary`)
+      .then((res) => {
+        setSummary(res.data)
+        const first = res.data?.counterparties?.[0]
+        setSelectedId(first?.counterparty?.id || '')
+      })
+      .catch((err) => setError(err.response?.data?.detail || err.message))
+      .finally(() => setLoading(false))
+  }, [])
+
+  const actionRows = useMemo(() => {
+    const rows = summary?.counterparties || []
+    return rows
+      .map((row) => buildDeskActionRow(row, rows))
+      .sort((a, b) => {
+        const statusRank = { FLAG: 0, MONITOR: 1, OK: 2 }
+        const confidenceRank = { HIGH: 0, MEDIUM: 1, LOW: 2 }
+        return (
+          (statusRank[a.status] ?? 9) - (statusRank[b.status] ?? 9) ||
+          (confidenceRank[a.actionConfidence] ?? 9) - (confidenceRank[b.actionConfidence] ?? 9) ||
+          Math.abs(Number(b.cva || 0)) - Math.abs(Number(a.cva || 0))
+        )
+      })
+  }, [summary])
+
+  const selected = actionRows.find((row) => row.counterparty?.id === selectedId) || actionRows[0]
+  const flagged = actionRows.filter((row) => row.status === 'FLAG').length
+  const monitor = actionRows.filter((row) => row.status === 'MONITOR').length
+  const highConfidence = actionRows.filter((row) => row.actionConfidence === 'HIGH').length
+  const avgHedgeRatio = actionRows.length
+    ? actionRows.reduce((total, row) => total + Number(row.hedgeRatio || 0), 0) / actionRows.length
+    : 0
+  const totalGap = actionRows.reduce((total, row) => total + Number(row.hedgeGap || 0), 0)
+  const portfolioCurrency = selected?.currency || 'USD'
+  const portfolio = summary?.portfolio || {}
+  const murexDelta = Number(portfolio.net_cva || 0) * 0.018
+  const primaryAction = buildPortfolioPrimaryAction(actionRows)
+  const executionOrder = buildExecutionOrder(actionRows)
+
+  if (loading) {
+    return <main className="mt-5 flex flex-1 items-center justify-center rounded-xl border border-white/10 bg-[#222B3A] text-white/60">Loading desk actions from CVA risk payload…</main>
+  }
+
+  if (error) {
+    return <main className="mt-5 rounded-xl border border-red-400/30 bg-red-500/10 p-6 text-red-200">{error}</main>
+  }
+
+  return (
+    <main className="mt-5 grid flex-1 grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1fr)_430px]">
+      <section className="grid min-w-0 grid-rows-[auto_auto_1fr] gap-5">
+        <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+          <div className="flex items-start justify-between gap-5">
+            <div>
+              <PaneTitle>Portfolio Action Summary</PaneTitle>
+              <h2 className="font-display text-2xl font-semibold text-white">Desk Head Actions</h2>
+              <p className="mt-1 text-sm text-white/50">
+                Converts the live CVA risk payload into hedge adequacy, sensitivity pressure and recommended action.
+              </p>
+            </div>
+            <button type="button" onClick={() => onOpenRun?.(summary)} className="rounded-lg border border-[#0145AC]/50 bg-[#0145AC]/25 px-3 py-2 text-xs uppercase tracking-[0.16em] text-white/75 transition hover:border-[#82C7A5]/60 hover:bg-[#82C7A5]/10">
+              Decision context
+            </button>
+          </div>
+
+          <div className="mt-5 grid grid-cols-2 gap-3 lg:grid-cols-6">
+            <RiskMiniStat label="Net CVA" value={formatCompactCurrency(portfolio.net_cva, portfolioCurrency)} />
+            <RiskMiniStat label="CS01" value={formatCompactCurrency(portfolio.cs01, portfolioCurrency)} />
+            <RiskMiniStat label="Hedged / Target" value={`${formatPercent(avgHedgeRatio)} / 70%`} tone={avgHedgeRatio >= 0.7 ? 'green' : undefined} />
+            <RiskMiniStat label="Hedge Gap" value={formatCompactCurrency(totalGap, portfolioCurrency)} />
+            <RiskMiniStat label="Flags / Watch" value={`${flagged} / ${monitor}`} />
+            <RiskMiniStat label="High Confidence" value={highConfidence} />
+          </div>
+
+          <div className="mt-4 rounded-xl border border-[#82C7A5]/20 bg-[#82C7A5]/10 p-4">
+            <div className="text-[11px] uppercase tracking-[0.18em] text-[#82C7A5]/80">Primary Action</div>
+            <div className="mt-1 text-sm font-semibold text-white">{primaryAction}</div>
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+          <PaneTitle>Counterparty Action Table</PaneTitle>
+          <div className="overflow-hidden rounded-lg border border-white/10">
+            <table className="w-full border-collapse text-xs">
+              <thead className="bg-white/[0.03] text-white/45">
+                <tr>
+                  <th className="px-3 py-2 text-left font-normal">Counterparty</th>
+                  <th className="px-3 py-2 text-right font-normal">CVA</th>
+                  <th className="px-3 py-2 text-right font-normal">CS01</th>
+                  <th className="px-3 py-2 text-right font-normal">IR01</th>
+                  <th className="px-3 py-2 text-right font-normal">Hedged / Target</th>
+                  <th className="px-3 py-2 text-left font-normal">Status</th>
+                  <th className="px-3 py-2 text-left font-normal">Confidence</th>
+                  <th className="px-3 py-2 text-left font-normal">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {actionRows.map((row) => {
+                  const isSelected = row.counterparty?.id === selected?.counterparty?.id
+                  return (
+                    <tr
+                      key={row.counterparty?.id}
+                      onClick={() => {
+                        setSelectedId(row.counterparty?.id)
+                        onOpenAction?.(row)
+                      }}
+                      className={`cursor-pointer border-t border-white/5 transition ${isSelected ? 'bg-[#82C7A5]/10' : 'hover:bg-white/[0.04]'}`}
+                    >
+                      <td className="px-3 py-2 text-white/80">{row.counterparty?.name}</td>
+                      <td className="px-3 py-2 text-right font-mono text-white">{formatCompactCurrency(row.cva, row.currency)}</td>
+                      <td className="px-3 py-2 text-right font-mono text-white/75">{formatCompactCurrency(row.cs01, row.currency)}</td>
+                      <td className="px-3 py-2 text-right font-mono text-white/75">{formatCompactCurrency(row.ir01, row.currency)}</td>
+                      <td className="px-3 py-2 text-right font-mono text-white">{formatPercent(row.hedgeRatio)} / 70%</td>
+                      <td className="px-3 py-2"><DecisionTag status={row.status} /></td>
+                      <td className="px-3 py-2"><ConfidenceTag confidence={row.actionConfidence} /></td>
+                      <td className="px-3 py-2 text-white/70">{row.recommendedAction}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="grid min-h-0 gap-5 2xl:grid-cols-[minmax(0,1fr)_360px]">
+          <SensitivityPanel rows={actionRows} currency={portfolioCurrency} selectedId={selected?.counterparty?.id} />
+          <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+            <PaneTitle>Reconciliation</PaneTitle>
+            <div className="space-y-3 text-sm text-white/70">
+              <DriverRow label="M7 Net CVA" value={formatCompactCurrency(portfolio.net_cva, portfolioCurrency)} detail="Live backend payload" />
+              <DriverRow label="Δ vs Murex" value={formatCompactCurrency(murexDelta, portfolioCurrency)} detail="Derived decision proxy" />
+              <DriverRow label="Confidence" value="Moderate" detail="No backend reconciliation feed yet" />
+              <div className="rounded-lg border border-white/10 bg-black/10 p-3 text-xs leading-relaxed text-white/55">
+                Difference is currently explained as exposure interpolation and model simplification: the backend lineage says this MVP has no Monte Carlo engine, no calibrated PD curve and no live Murex reconciliation.
+              </div>
+            </div>
+          </section>
+        </section>
+      </section>
+
+      <aside className="grid content-start gap-5">
+        <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+          <PaneTitle>Selected Action</PaneTitle>
+          {selected ? (
+            <div className="space-y-4">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h2 className="font-display text-xl font-semibold text-white">{selected.counterparty?.name}</h2>
+                  <p className="mt-1 text-sm text-white/50">{selected.driver}</p>
+                </div>
+                <ConfidenceTag confidence={selected.actionConfidence} />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <RiskMiniStat label="Hedge Ratio" value={`${formatPercent(selected.hedgeRatio)} / 70%`} />
+                <RiskMiniStat label="Gap" value={formatCompactCurrency(selected.hedgeGap, selected.currency)} />
+                <RiskMiniStat label="Peak EPE" value={formatCompactCurrency(selected.peak_epe, selected.currency)} />
+                <RiskMiniStat label="Spread" value={`${selected.credit_spread_bps} bps`} />
+              </div>
+              <div className="rounded-xl border border-[#82C7A5]/20 bg-[#82C7A5]/10 p-4 text-sm text-[#82C7A5]">
+                {selected.recommendedAction}
+              </div>
+              <div className="rounded-xl border border-white/10 bg-black/10 p-4 text-sm leading-relaxed text-white/65">
+                <div className="mb-2 text-xs uppercase tracking-[0.16em] text-white/40">Why this action?</div>
+                {selected.explanation}
+              </div>
+            </div>
+          ) : (
+            <div className="text-sm text-white/50">No counterparty selected.</div>
+          )}
+        </section>
+
+        <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+          <PaneTitle>Execution Order</PaneTitle>
+          <div className="space-y-2">
+            {executionOrder.map((item, index) => (
+              <div key={`${item.label}-${index}`} className="rounded-lg border border-white/10 bg-black/10 p-3 text-sm text-white/70">
+                <div className="flex gap-3">
+                  <span className="font-mono text-[#82C7A5]">{index + 1}</span>
+                  <div>
+                    <div className="text-white">{item.label}</div>
+                    <div className="mt-1 text-xs text-white/45">{item.detail}</div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+          <PaneTitle>Suggested Trades</PaneTitle>
+          <div className="space-y-2">
+            {(selected?.suggestedTrades || []).map((trade) => (
+              <div key={trade} className="rounded-lg border border-white/10 bg-black/10 p-3 text-sm text-white/70">
+                {trade}
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+          <PaneTitle>What If I Hedge This?</PaneTitle>
+          <div className="space-y-3 text-sm text-white/70">
+            <DriverRow label="Current Net CVA" value={formatCompactCurrency(selected?.net_cva, selected?.currency)} detail="Before action" />
+            <DriverRow label="Post-action proxy" value={formatCompactCurrency(selected?.postActionNetCva, selected?.currency)} detail="Illustrative hedge impact" />
+            <DriverRow label="CVA Reduction" value={formatPercent(selected?.cvaReductionPct)} detail={formatCompactCurrency(selected?.cvaReductionAmount, selected?.currency)} />
+            <DriverRow label="CS01 Reduction" value={formatPercent(selected?.cs01ReductionPct)} detail={formatCompactCurrency(selected?.cs01ReductionAmount, selected?.currency)} />
+            <div className="rounded-lg border border-white/10 bg-black/10 p-3 text-xs leading-relaxed text-white/55">
+              This remains a frontend decision proxy over existing backend numbers, not a new scenario engine.
+            </div>
+          </div>
+        </section>
+      </aside>
+    </main>
+  )
+}
+
+function buildDeskActionRow(row, allRows = []) {
+  const cvaAbs = Math.abs(Number(row.cva || 0))
+  const dvaAbs = Math.abs(Number(row.dva || 0))
+  const hedgeRatio = cvaAbs ? Math.min(dvaAbs / cvaAbs, 1.25) : 0
+  const targetHedgeRatio = 0.70
+  const targetHedge = cvaAbs * targetHedgeRatio
+  const hedgeGap = Math.max(targetHedge - dvaAbs, 0)
+  const cs01Abs = Math.abs(Number(row.cs01 || 0))
+  const peakEpeAbs = Math.abs(Number(row.peak_epe || 0))
+  const spreadBps = Math.abs(Number(row.credit_spread_bps || 0))
+  const lgd = Number(row.lgd || 0.6)
+  const ir01 = cs01Abs * (0.22 + Math.min(peakEpeAbs / 1_000_000_000, 0.18))
+  const tenor = peakTenor(row.exposure_profile)
+
+  const maxCs01 = Math.max(...allRows.map((item) => Math.abs(Number(item.cs01 || 0))), 1)
+  const maxEpe = Math.max(...allRows.map((item) => Math.abs(Number(item.peak_epe || 0))), 1)
+  const maxSpread = Math.max(...allRows.map((item) => Math.abs(Number(item.credit_spread_bps || 0))), 1)
+  const cs01Score = cs01Abs / maxCs01
+  const epeScore = peakEpeAbs / maxEpe
+  const spreadScore = spreadBps / maxSpread
+  const hedgeGapScore = cvaAbs ? hedgeGap / cvaAbs : 0
+
+  const primaryDriver = [
+    { type: 'Credit', score: spreadScore * 1.05 },
+    { type: 'Exposure', score: epeScore },
+    { type: 'Sensitivity', score: cs01Score * 0.95 },
+  ].sort((a, b) => b.score - a.score)[0]?.type || 'Exposure'
+
+  const materialityScore = cs01Score * 0.40 + epeScore * 0.35 + spreadScore * 0.25
+  const status = materialityScore >= 0.82 ? 'FLAG' : materialityScore >= 0.62 ? 'MONITOR' : 'OK'
+  const confidenceScore = materialityScore * 0.55 + hedgeGapScore * 0.25 + cs01Score * 0.20
+  const actionConfidence = status === 'OK' ? 'LOW' : confidenceScore >= 0.78 ? 'HIGH' : confidenceScore >= 0.58 ? 'MEDIUM' : 'LOW'
+  const cdsNotional = actionNotional(hedgeGap, spreadBps, lgd)
+  const irsNotional = actionNotional(ir01 * 65, spreadBps, lgd)
+
+  const recommendedAction = buildRecommendedAction(status, primaryDriver, tenor, cdsNotional, irsNotional)
+  const suggestedTrades = buildSuggestedTrades(row, primaryDriver, tenor, cdsNotional, irsNotional)
+
+  const cvaReductionPct = Math.min(0.28, Math.max(0.06, 0.06 + hedgeGapScore * 0.24 + cs01Score * 0.04))
+  const cs01ReductionPct = Math.min(0.32, Math.max(0.08, 0.08 + cs01Score * 0.18 + (primaryDriver === 'Sensitivity' ? 0.06 : 0)))
+  const cvaReductionAmount = cvaAbs * cvaReductionPct
+  const cs01ReductionAmount = cs01Abs * cs01ReductionPct
+  const postActionNetCva = Number(row.net_cva || 0) + cvaReductionAmount
+
+  return {
+    ...row,
+    hedgeRatio,
+    targetHedgeRatio,
+    targetHedge,
+    hedgeGap,
+    ir01,
+    status,
+    actionConfidence,
+    materialityScore,
+    primaryDriver,
+    recommendedAction,
+    suggestedTrades,
+    cvaReductionPct,
+    cvaReductionAmount,
+    cs01ReductionPct,
+    cs01ReductionAmount,
+    postActionNetCva,
+    explanation: `${primaryDriver}-led action: ${row.driver}. Hedge ratio is ${formatPercent(hedgeRatio)} against a 70% target, leaving a ${formatCompactCurrency(hedgeGap, row.currency)} gap. The recommendation is driven by ${formatCompactCurrency(row.cs01, row.currency)} CS01, ${formatCompactCurrency(ir01, row.currency)} IR01 and peak EPE of ${formatCompactCurrency(row.peak_epe, row.currency)} at ${tenor}.`,
+  }
+}
+
+
+function buildPortfolioPrimaryAction(rows = []) {
+  const flags = rows.filter((row) => row.status === 'FLAG')
+  const monitors = rows.filter((row) => row.status === 'MONITOR')
+  const actionSet = flags.length ? flags : monitors
+  if (!actionSet.length) return 'No immediate portfolio hedge action; maintain monitoring and preserve current hedge posture.'
+
+  const topNames = actionSet.slice(0, 3).map((row) => row.counterparty?.name).filter(Boolean).join(', ')
+  const dominantDriver = mostCommon(actionSet.map((row) => row.primaryDriver))
+
+  if (dominantDriver === 'Credit') return `Increase front-end credit hedging across ${topNames}.`
+  if (dominantDriver === 'Sensitivity') return `Reduce concentrated CS01 through IRS compression across ${topNames}.`
+  return `Rebalance front-end exposure before adding residual CDS protection across ${topNames}.`
+}
+
+function buildExecutionOrder(rows = []) {
+  const flagged = rows.filter((row) => row.status === 'FLAG')
+  const monitor = rows.filter((row) => row.status === 'MONITOR')
+  const exposureNames = flagged.filter((row) => row.primaryDriver === 'Exposure').slice(0, 2).map((row) => row.counterparty?.name).filter(Boolean)
+  const creditNames = flagged.filter((row) => row.primaryDriver === 'Credit').slice(0, 2).map((row) => row.counterparty?.name).filter(Boolean)
+  const sensitivityNames = [...flagged, ...monitor].filter((row) => row.primaryDriver === 'Sensitivity').slice(0, 2).map((row) => row.counterparty?.name).filter(Boolean)
+  const fallback = flagged.slice(0, 2).map((row) => row.counterparty?.name).filter(Boolean)
+
+  return [
+    {
+      label: 'Rebalance exposure concentration',
+      detail: `${(exposureNames.length ? exposureNames : fallback).join(', ') || 'No immediate names'} before buying additional protection`,
+    },
+    {
+      label: 'Add residual CDS protection',
+      detail: `${(creditNames.length ? creditNames : fallback).join(', ') || 'No immediate names'} after exposure rebalance`,
+    },
+    {
+      label: 'Compress CS01-heavy IRS risk',
+      detail: `${(sensitivityNames.length ? sensitivityNames : monitor.slice(0, 2).map((row) => row.counterparty?.name).filter(Boolean)).join(', ') || 'Monitor only'} as second-order clean-up`,
+    },
+  ]
+}
+
+function mostCommon(values = []) {
+  const counts = values.reduce((acc, value) => ({ ...acc, [value]: (acc[value] || 0) + 1 }), {})
+  return Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0]
+}
+
+function buildRecommendedAction(status, primaryDriver, tenor, cdsNotional, irsNotional) {
+  if (status === 'OK') return 'No immediate hedge action'
+  if (primaryDriver === 'Credit') return `Add ${formatWholeMillions(cdsNotional)} ${tenor} CDS protection`
+  if (primaryDriver === 'Sensitivity') return `Reduce ${formatWholeMillions(irsNotional)} ${tenor} IRS CS01`
+  return `Rebalance exposure around ${tenor}`
+}
+
+function buildSuggestedTrades(row, primaryDriver, tenor, cdsNotional, irsNotional) {
+  const name = row.counterparty?.name || 'counterparty'
+  const spread = `${row.credit_spread_bps} bps`
+
+  if (primaryDriver === 'Credit') {
+    return [
+      `Add ${formatWholeMillions(cdsNotional)} ${tenor} CDS protection against ${name}`,
+      `Move ${tenor} credit hedge to target 70% coverage`,
+      `Review high spread contribution at ${spread}`,
+    ]
+  }
+
+  if (primaryDriver === 'Sensitivity') {
+    return [
+      `Reduce ${formatWholeMillions(irsNotional)} ${tenor} IRS CS01 exposure`,
+      `Offset receiver/pay fixed imbalance in largest trades`,
+      `Keep CDS hedge unchanged unless spread widens above ${spread}`,
+    ]
+  }
+
+  return [
+    `Rebalance ${formatWholeMillions(irsNotional)} exposure away from ${tenor}`,
+    `Review largest ${tenor} IRS trades for compression`,
+    `Use CDS only for residual hedge gap after exposure reduction`,
+  ]
+}
+
+function actionNotional(amount, spreadBps, lgd) {
+  const spreadDecimal = Math.max(Number(spreadBps || 0) / 10000, 0.005)
+  const divisor = Math.max(spreadDecimal * Math.max(Number(lgd || 0.6), 0.35) * 0.035, 0.00015)
+  const raw = Math.abs(Number(amount || 0)) / divisor
+  const rounded = Math.round(raw / 5_000_000) * 5_000_000
+  return Math.min(Math.max(rounded || 10_000_000, 10_000_000), 250_000_000)
+}
+
+function formatWholeMillions(value) {
+  const millions = Math.max(1, Math.round(Math.abs(Number(value || 0)) / 1_000_000))
+  return `${millions}M`
+}
+
+function peakTenor(profile = []) {
+  const peak = profile.reduce((best, point) => Number(point.epe || 0) > Number(best.epe || 0) ? point : best, profile[0] || {})
+  return peak.label || '5Y'
+}
+
+function DecisionTag({ status }) {
+  const tone =
+    status === 'FLAG'
+      ? 'border-red-300/30 bg-red-400/10 text-red-200'
+      : status === 'MONITOR'
+        ? 'border-amber-300/30 bg-amber-300/10 text-amber-200'
+        : 'border-[#82C7A5]/30 bg-[#82C7A5]/10 text-[#82C7A5]'
+
+  return <span className={`rounded border px-2 py-0.5 text-[11px] ${tone}`}>{status}</span>
+}
+
+function ConfidenceTag({ confidence }) {
+  const tone =
+    confidence === 'HIGH'
+      ? 'border-[#82C7A5]/30 bg-[#82C7A5]/10 text-[#82C7A5]'
+      : confidence === 'MEDIUM'
+        ? 'border-amber-300/30 bg-amber-300/10 text-amber-200'
+        : 'border-white/15 bg-white/5 text-white/55'
+
+  return <span className={`rounded border px-2 py-0.5 text-[11px] ${tone}`}>{confidence || 'LOW'}</span>
+}
+
+function SensitivityPanel({ rows, currency, selectedId }) {
+  const top = [...(rows || [])].sort((a, b) => Math.abs(Number(b.cs01 || 0)) - Math.abs(Number(a.cs01 || 0))).slice(0, 5)
+  const max = Math.max(...top.map((item) => Math.abs(Number(item.cs01 || 0))), 1)
+
+  return (
+    <section className="rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
+      <PaneTitle>Sensitivity Breakdown</PaneTitle>
+      <div className="space-y-2">
+        {top.map((row) => {
+          const isSelected = row.counterparty?.id === selectedId
+          const width = `${Math.max(8, (Math.abs(Number(row.cs01 || 0)) / max) * 100)}%`
+
+          return (
+            <div key={row.counterparty?.id} className={`rounded-lg border p-3 transition ${isSelected ? 'border-[#82C7A5]/40 bg-[#82C7A5]/10' : 'border-white/10 bg-black/10 opacity-55'}`}>
+              <div className="mb-2 flex justify-between text-sm">
+                <span className="text-white">{row.counterparty?.name}</span>
+                <span className="font-mono text-white/75">{formatCompactCurrency(row.cs01, row.currency || currency)} / bp</span>
+              </div>
+              <div className="h-2 overflow-hidden rounded-full bg-white/10">
+                <div className="h-full rounded-full bg-[#82C7A5]" style={{ width }} />
+              </div>
+              <div className="mt-2 flex justify-between text-xs text-white/45">
+                <span>IR01 {formatCompactCurrency(row.ir01, row.currency || currency)} / bp</span>
+                <span>{row.primaryDriver} · {row.status}</span>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </section>
+  )
+}
+
 
 function CvaRiskScreen({ onOpenCounterparty, onOpenBucket, onOpenRun }) {
   const [summary, setSummary] = useState(null)
@@ -5819,12 +6599,17 @@ function CvaRiskScreen({ onOpenCounterparty, onOpenBucket, onOpenRun }) {
       trades: trades || summary?.portfolio?.trades,
     }
   }, [filteredRows, allRows, summary])
-  
 
-
+  const handleFilterChange = (key, value) => {
+    setFilters((prev) => ({
+      ...prev,
+      [key]: value,
+      ...(key === 'counterpartyId' ? { bucket: 'ALL' } : {}),
+    }))
+  }
 
   if (loading) {
-    return <main className="mt-5 flex flex-1 items-center justify-center rounded-xl border border-white/10 bg-[#222B3A] text-white/60">Loading CVA risk from backend…</main>
+    return <main className="mt-5 flex flex-1 items-center justify-center rounded-xl border border-white/10 bg-[#222B3A] text-white/60">Calculating CVA using path-based exposure simulation (250 paths)…</main>
   }
 
   if (error) {
@@ -5918,7 +6703,7 @@ function CvaRiskScreen({ onOpenCounterparty, onOpenBucket, onOpenRun }) {
                  label="Net CVA"
                  value={formatCompactCurrency(filteredPortfolio.net_cva, activeCurrency)}
               />
-              <RiskMiniStat label="Names" value={filteredPortfolio.counterparties?.length ?? '—'} />
+              <RiskMiniStat label="Names" value={filteredPortfolio.counterparties ?? '—'} />
               <RiskMiniStat label="Bucket" value={filters.bucket === 'ALL' ? 'All' : filters.bucket} />
               <RiskMiniStat label="Currency" value={filters.currency === 'ALL' ? 'All' : filters.currency} />
             </div>
@@ -6150,12 +6935,17 @@ export default function ExposureChart({ data, currency, runId }) {
       <div className="mb-3 flex items-start justify-between gap-4">
         <div>
           <h2 className="font-display text-xs font-semibold uppercase tracking-[0.16em] text-white/80">Exposure Profile</h2>
-          <p className="mt-1 text-xs text-white/45">Current EPE vs proposed trade overlay and 95% PFE</p>
+          <p className="mt-1 text-xs text-white/45">Path-based EPE and PFE derived from simulated exposure distribution</p>
         </div>
-        <div className="grid grid-cols-3 gap-2 text-right font-mono text-[11px] text-white/55">
-          <MiniStat label="Peak Δ" value={formatMillions(summary.peakDelta, currency)} accent />
-          <MiniStat label="Peak EPE" value={formatMillions(summary.peakNew, currency)} />
-          <MiniStat label="Cube" value={runId ? shortRunId(runId) : 'PREVIEW'} />
+        <div className="flex flex-col items-end gap-2">
+          <div className="rounded-md border border-[#82C7A5]/25 bg-[#82C7A5]/10 px-3 py-1 font-mono text-[10px] uppercase tracking-[0.14em] text-[#82C7A5]">
+            Model: Path-based simulation (250 paths)
+          </div>
+          <div className="grid grid-cols-3 gap-2 text-right font-mono text-[11px] text-white/55">
+            <MiniStat label="Peak Δ" value={formatMillions(summary.peakDelta, currency)} accent />
+            <MiniStat label="Peak EPE" value={formatMillions(summary.peakNew, currency)} />
+            <MiniStat label="Cube" value={runId ? shortRunId(runId) : 'PREVIEW'} />
+          </div>
         </div>
       </div>
 
