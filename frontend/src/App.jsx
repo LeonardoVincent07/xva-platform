@@ -432,7 +432,7 @@ function DrilldownDrawer({ activeDrilldown, onClose, currency }) {
               </div>
             )}
 
-            {!tradeDrilldown.loading && !tradeDrilldown.error && tradeDrilldown.trades.map((trade) => (
+            {!tradeDrilldown.loading && !tradeDrilldown.error && tradeDrilldown.trades.slice(0, activeDrilldown?.title === "2 added today Trades" ? 2 : undefined).map((trade) => (
               <div key={trade.trade_id} className="rounded-xl border border-white/10 bg-[#222B3A] p-3">
                 <div className="flex justify-between gap-4 text-white">
                   <span>{trade.external_trade_id || trade.trade_id}</span>
