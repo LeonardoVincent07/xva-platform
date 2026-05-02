@@ -20,6 +20,18 @@ from backend.app.modules.trades.models import (
     CvaResult,
 )
 
+from backend.app.modules.exposure.path_engine import (
+    PATH_COUNT,
+    MODEL_VERSION as EXPOSURE_MODEL_VERSION,
+    build_incremental_profile as build_path_incremental_profile,
+    build_portfolio_profile as build_path_portfolio_profile,
+)
+from backend.app.modules.cva.cva_engine import (
+    CVA_MODEL_VERSION,
+    calculate_cva_profile,
+    calculate_incremental_cva,
+)
+
 router = APIRouter(prefix="/screens", tags=["screens"])
 
 
@@ -178,11 +190,14 @@ def calculate_from_screen1(request: Screen1Request):
             direction=request.direction,
         )
 
-        incremental_epe = max(
-            max(point["epe_new_trade"] - point["epe_current"], 0)
-            for point in profile
+        credit_points = db.query(CurvePoint).filter(CurvePoint.curve_id == credit_curve.curve_id).all()
+        spread_by_tenor = {p.tenor: float(p.value or 0) for p in credit_points}
+
+        cva_incremental = calculate_incremental_cva(
+            profile=profile,
+            spread_by_tenor=spread_by_tenor,
+            recovery_rate=float(recovery.recovery_rate),
         )
-        cva_incremental = -abs(incremental_epe * credit_spread * lgd * maturity_years * 0.19)
         dva_incremental = abs(cva_incremental) * 0.146
         fva_incremental = -abs(cva_incremental) * 0.346
         total_xva_charge = cva_incremental + dva_incremental + fva_incremental
@@ -201,7 +216,7 @@ def calculate_from_screen1(request: Screen1Request):
                 csa_id=csa.csa_id,
                 valuation_date=snapshot.valuation_date,
                 status="CALCULATED",
-                model_version="MVP-INCREMENTAL-XVA-0.2",
+                model_version=f"{EXPOSURE_MODEL_VERSION}+{CVA_MODEL_VERSION}",
             )
         )
         db.flush()
@@ -242,6 +257,14 @@ def calculate_from_screen1(request: Screen1Request):
             "calculation_run_id": run_id,
             "valuation_date": str(snapshot.valuation_date),
             "maturity_date": str(maturity_date),
+            "simulation": {
+                "method": "Synthetic path exposure approximation",
+                "path_count": PATH_COUNT,
+                "time_buckets": len(profile),
+                "monte_carlo_ready": True,
+                "exposure_model_version": EXPOSURE_MODEL_VERSION,
+                "cva_model_version": CVA_MODEL_VERSION,
+            },
             "counterparty": {"id": counterparty.counterparty_id, "name": counterparty.name},
             "netting_set": build_netting_set_payload(netting_set, existing_trades),
             "par_rate_pct": par_rate_pct,
@@ -317,54 +340,31 @@ def get_cva_risk_summary():
             recovery_rate = float(recovery.recovery_rate) if recovery else 0.40
             lgd = 1.0 - recovery_rate
 
-            cva_total = 0.0
-            exposure_profile = []
-            peak_epe = 0.0
-            peak_bucket = "—"
+            cva_result = calculate_cva_profile(
+                profile=profile,
+                spread_by_tenor=spread_by_tenor,
+                recovery_rate=recovery_rate,
+                epe_field="epe_current",
+            )
+            cva_total = cva_result["total_cva"]
+            exposure_profile = cva_result["exposure_profile"]
+            peak_epe = cva_result["peak_epe"]
+            peak_bucket = cva_result["peak_bucket"]
 
-            for point in profile:
-                label = point["label"]
-                spread = spread_by_tenor.get(label) or default_spread
-                epe = float(point["epe_current"] or 0)
-                pfe = float(point["pfe_95"] or 0)
-                year = float(point["year"] or 0)
-                marginal_pd = min(spread * max(year, 0.08), 0.45)
-                discount_factor = 1 / ((1 + 0.035) ** max(year, 0.08))
-                cva_contribution = -abs(epe * marginal_pd * lgd * discount_factor * 0.18)
-
-                cva_total += cva_contribution
-                if epe > peak_epe:
-                    peak_epe = epe
-                    peak_bucket = label
-
-                bucket_payload = {
-                    "label": label,
-                    "date": point["date"],
-                    "year": year,
-                    "epe": round(epe, 2),
-                    "pfe_95": round(pfe, 2),
-                    "credit_spread_bps": round(spread * 10000, 1),
-                    "marginal_pd": round(marginal_pd, 6),
-                    "recovery_rate": round(recovery_rate, 4),
-                    "lgd": round(lgd, 4),
-                    "discount_factor": round(discount_factor, 6),
-                    "cva_contribution": round(cva_contribution, 2),
-                    "driver": "Exposure" if epe >= peak_epe else "Credit / LGD",
-                }
-                exposure_profile.append(bucket_payload)
-
+            for bucket_payload in exposure_profile:
+                label = bucket_payload["label"]
                 if label not in portfolio_buckets:
                     portfolio_buckets[label] = {
                         "label": label,
-                        "date": point["date"],
-                        "year": year,
+                        "date": bucket_payload["date"],
+                        "year": bucket_payload["year"],
                         "epe": 0.0,
                         "pfe_95": 0.0,
                         "cva_contribution": 0.0,
                     }
-                portfolio_buckets[label]["epe"] += epe
-                portfolio_buckets[label]["pfe_95"] += pfe
-                portfolio_buckets[label]["cva_contribution"] += cva_contribution
+                portfolio_buckets[label]["epe"] += float(bucket_payload["epe"] or 0)
+                portfolio_buckets[label]["pfe_95"] += float(bucket_payload["pfe_95"] or 0)
+                portfolio_buckets[label]["cva_contribution"] += float(bucket_payload["cva_contribution"] or 0)
 
             cs01 = abs(cva_total) * 0.0118
             # MVP DVA proxy: positive own-credit offset against counterparty CVA.
@@ -436,7 +436,7 @@ def get_cva_risk_summary():
             "status": "LIVE",
             "calculation_run_id": "CVA-RISK-LIVE-VIEW",
             "valuation_date": str(snapshot.valuation_date),
-            "model_version": "MVP-CVA-RISK-0.1",
+            "model_version": f"{EXPOSURE_MODEL_VERSION}+{CVA_MODEL_VERSION}",
             "portfolio": {
                 "cva": round(total_cva, 2),
                 "dva": round(total_dva, 2),
@@ -448,10 +448,18 @@ def get_cva_risk_summary():
             },
             "counterparties": rows,
             "buckets": ordered_buckets,
+            "simulation": {
+                "method": "Synthetic path exposure approximation",
+                "path_count": PATH_COUNT,
+                "time_buckets": len(ordered_buckets),
+                "monte_carlo_ready": True,
+                "exposure_model_version": EXPOSURE_MODEL_VERSION,
+                "cva_model_version": CVA_MODEL_VERSION,
+            },
             "lineage": {
                 "source_tables": ["counterparties", "netting_sets", "irs_trades", "curves", "curve_points", "recovery_rates"],
-                "method": "Simplified MVP CVA aggregation: exposure x marginal PD x LGD x discount factor; DVA is an MVP own-credit offset proxy",
-                "limitations": ["No Monte Carlo engine", "No calibrated PD curve", "No Murex reconciliation yet"],
+                "method": "Synthetic path exposure approximation: 250 deterministic scenario paths across tenor buckets; EPE and PFE are derived from positive exposure distributions; CVA is aggregated from EPE, marginal PD, LGD and discount factors.",
+                "limitations": ["Not a full grid Monte Carlo engine", "Deterministic synthetic path set", "No calibrated stochastic rates model", "No Murex reconciliation yet"],
             },
         }
     finally:
@@ -496,23 +504,7 @@ def build_netting_set_payload(netting_set: NettingSet, trades: list[IrsTrade]):
 
 
 def build_portfolio_profile(valuation_date: date, existing_trades: list[IrsTrade], currency: str):
-    profile = []
-    for label, year in profile_buckets():
-        current_epe = portfolio_epe(existing_trades, year, currency)
-        pfe_95 = current_epe * 1.62
-        bucket_date = valuation_date + timedelta(days=int(365 * year))
-        profile.append(
-            {
-                "label": label,
-                "date": str(bucket_date),
-                "year": round(year, 4),
-                "show_tick": True,
-                "epe_current": round(current_epe, 2),
-                "epe_new_trade": round(current_epe, 2),
-                "pfe_95": round(pfe_95, 2),
-            }
-        )
-    return profile
+    return build_path_portfolio_profile(valuation_date, existing_trades, currency)
 
 
 def build_incremental_profile(
@@ -524,32 +516,15 @@ def build_incremental_profile(
     rate_delta_bps: float,
     direction: str,
 ):
-    direction_sign = 1 if direction.upper() == "PAY" else -1
-    rate_sensitivity = 1 + min(abs(rate_delta_bps) / 50, 0.35)
-    profile = []
-
-    for label, year in profile_buckets():
-        current_epe = portfolio_epe(existing_trades, year, currency)
-        progress = min(year / max(maturity_years, 0.25), 1)
-        trade_shape = math.sin(progress * math.pi) ** 1.20 if progress < 1 else 0
-        trade_increment = trade_notional * 0.115 * trade_shape * rate_sensitivity * direction_sign
-        epe_new_trade = max(current_epe + trade_increment, 0)
-        pfe_95 = max(epe_new_trade * 1.68, current_epe * 1.62)
-        bucket_date = valuation_date + timedelta(days=int(365 * year))
-
-        profile.append(
-            {
-                "label": label,
-                "date": str(bucket_date),
-                "year": round(year, 4),
-                "show_tick": True,
-                "epe_current": round(current_epe, 2),
-                "epe_new_trade": round(epe_new_trade, 2),
-                "pfe_95": round(pfe_95, 2),
-            }
-        )
-
-    return profile
+    return build_path_incremental_profile(
+        valuation_date=valuation_date,
+        existing_trades=existing_trades,
+        currency=currency,
+        trade_notional=trade_notional,
+        maturity_years=maturity_years,
+        rate_delta_bps=rate_delta_bps,
+        direction=direction,
+    )
 
 
 def profile_buckets():
@@ -664,4 +639,5 @@ def to_bps(amount: float, notional: float) -> float:
     if notional == 0:
         return 0
     return amount / notional * 10000
+
 
