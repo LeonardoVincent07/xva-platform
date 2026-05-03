@@ -268,9 +268,12 @@ export default function App() {
               title="Drill into exposure profile"
             >
               <ExposureChart
-                data={displayData?.exposure_profile || []}
+                data={preview?.exposure_profile || displayData?.exposure_profile || []}
+                newTradeData={result?.exposure_profile || null}
                 currency={form.currency}
                 runId={result?.calculation_run_id}
+                showNewTrade={Boolean(result)}
+                trade={form}
               />
             </div>
 
