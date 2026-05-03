@@ -13,7 +13,7 @@ export default function ExposureChart({ data, newTradeData = null, currency, run
             Model: Path-based simulation (250 paths)
           </div>
           <div className="grid grid-cols-3 gap-2 text-right font-mono text-[11px] text-white/55">
-            <MiniStat label="Peak Δ" value={formatCompact(summary.peakDelta, currency)} accent />
+            <MiniStat label="Peak ΔEPE" value={formatSignedCompact(summary.peakDelta, currency)} accent />
             <MiniStat label="Peak EPE" value={formatMillions(summary.peakNew, currency)} />
             <MiniStat label="Cube" value={runId ? shortRunId(runId) : 'PREVIEW'} />
           </div>
@@ -55,7 +55,7 @@ function SvgChart({ data, newTradeData, currency, summary, showNewTrade, trade }
 
   const yTicks = [0, 0.25, 0.5, 0.75, 1]
   const xTicks = data.filter((point, index) => point.show_tick || index === 0 || index === data.length - 1)
-  const peakIndex = summary.peakIndex ?? 0
+  const peakIndex = showNewTrade ? summary.peakDeltaIndex ?? 0 : summary.peakNewIndex ?? 0
   const peakValues = showNewTrade ? newTrade : current
   const [peakX, peakY] = makePoint(peakValues[peakIndex] || 0, peakIndex)
 
@@ -104,8 +104,8 @@ function SvgChart({ data, newTradeData, currency, summary, showNewTrade, trade }
             <circle cx={peakX} cy={peakY} r="5" fill="#82C7A5" stroke="#1B212C" strokeWidth="2" />
             <g transform={`translate(${Math.min(peakX + 14, width - 210)} ${Math.max(peakY - 34, pad.top + 10)})`}>
               <rect width="168" height="34" rx="6" fill="rgba(0,0,0,0.36)" stroke="rgba(130,199,165,0.28)" />
-              <text x="10" y="14" fontSize="10" fill="rgba(255,255,255,0.45)">MAX NEW EPE</text>
-              <text x="10" y="27" fontSize="12" fill="#82C7A5" fontFamily="monospace">{formatMillions(summary.peakNew, currency)}</text>
+              <text x="10" y="14" fontSize="10" fill="rgba(255,255,255,0.45)">ΔEPE PEAK</text>
+              <text x="10" y="27" fontSize="12" fill="#82C7A5" fontFamily="monospace">{formatSignedCompact(summary.peakDelta, currency)}</text>
             </g>
           </>
         )}
@@ -161,22 +161,28 @@ function MiniStat({ label, value, accent }) {
 
 function buildSummary(data = [], showNewTrade = false, newTradeData = null, trade = {}) {
   let peakNew = 0
+  let peakNewIndex = 0
   let peakDelta = 0
-  let peakIndex = 0
+  let peakDeltaIndex = 0
   const postTrade = buildPostTradeEpeSeries(data, trade)
 
   data.forEach((point, index) => {
     const current = getCurrentEpe(point)
     const next = showNewTrade ? postTrade[index] : current
     const delta = next - current
+
     if (next > peakNew) {
       peakNew = next
-      peakIndex = index
+      peakNewIndex = index
     }
-    if (delta > peakDelta) peakDelta = delta
+
+    if (Math.abs(delta) > Math.abs(peakDelta)) {
+      peakDelta = delta
+      peakDeltaIndex = index
+    }
   })
 
-  return { peakNew, peakDelta, peakIndex }
+  return { peakNew, peakNewIndex, peakDelta, peakDeltaIndex }
 }
 
 function buildPostTradeEpeSeries(data = [], trade = {}) {
@@ -188,19 +194,23 @@ function buildPostTradeEpeSeries(data = [], trade = {}) {
   const maturityYears = Math.max(parseTenorYears(trade?.maturity_override || trade?.maturity || '5Y'), 0.25)
   const directionSign = String(trade?.direction || '').toUpperCase() === 'RECEIVE' ? -1 : 1
 
-  // This is a front-end visual overlay, not a second simulation engine.
-  // The backend result gives the XVA charge; the chart should show the portfolio
-  // EPE after adding a marginal trade. A small IRS must therefore be added as a
-  // tiny delta on top of the existing netting-set EPE, not rendered as a new
-  // standalone exposure profile.
+  // Front-end visual overlay only: keep the current portfolio EPE anchored and add
+  // a marginal, notional-scaled IRS exposure shape. The shape ramps up smoothly,
+  // peaks around the trade maturity and then runs off, avoiding the old standalone
+  // trade curve that overwhelmed the portfolio profile.
   const peakDelta = notional * Math.min(0.035, 0.012 + maturityYears * 0.0035)
 
   return data.map((point, index) => {
     const bucketYears = Math.max(parseTenorYears(point?.label || point?.tenor || point?.bucket || `${index + 1}Y`), 1 / 12)
-    const buildUp = Math.min(bucketYears / maturityYears, 1)
+    const x = Math.max(bucketYears / maturityYears, 0.01)
+
+    // x * exp(1 - x) is a smooth hump normalised to 1.0 at x = 1.
+    // It gives a gradual build-up for short buckets and a natural decay after maturity.
+    const smoothTermShape = x * Math.exp(1 - x)
     const runOff = bucketYears <= maturityYears ? 1 : Math.max(1 - (bucketYears - maturityYears) / Math.max(10 - maturityYears, 1), 0)
-    const shape = Math.sin((Math.PI / 2) * buildUp) * runOff
+    const shape = Math.max(0, smoothTermShape * runOff)
     const signedDelta = peakDelta * shape * directionSign
+
     return Math.max(current[index] + signedDelta, 0)
   })
 }
@@ -245,6 +255,12 @@ function getPfe(point = {}) {
 function niceMax(value) {
   const magnitude = 10 ** Math.floor(Math.log10(value || 1))
   return Math.ceil(value / magnitude / 0.25) * magnitude * 0.25
+}
+
+function formatSignedCompact(value, currency) {
+  const n = Number(value || 0)
+  if (n === 0) return `${currencySymbol(currency)}0`
+  return `${n > 0 ? '+' : '-'}${formatCompact(Math.abs(n), currency)}`
 }
 
 function formatCompact(value, currency) {
