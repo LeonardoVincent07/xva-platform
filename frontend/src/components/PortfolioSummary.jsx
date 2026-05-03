@@ -22,7 +22,7 @@ export default function PortfolioSummary({ counterparty, nettingSet, result, cur
       <div className="grid grid-cols-3 gap-3 rounded-xl border border-white/10 bg-[#222B3A] p-4 shadow-2xl shadow-black/15">
         <Metric label="Trades" value={nettingSet?.existing_trades ?? 0} />
         <Metric label="Gross Notional" value={formatCompactCurrency(grossNotional, currency)} />
-        <Metric label="Approx" value={`${approxTrades}`} />
+        <Metric label="Drivers" value={`${approxTrades}`} />
       </div>
     </section>
   )

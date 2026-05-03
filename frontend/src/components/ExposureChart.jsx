@@ -15,7 +15,7 @@ export default function ExposureChart({ data, newTradeData = null, currency, run
           <div className="grid grid-cols-3 gap-2 text-right font-mono text-[11px] text-white/55">
             <MiniStat label="Peak ΔEPE" value={formatSignedCompact(summary.peakDelta, currency)} accent />
             <MiniStat label="Peak EPE" value={formatMillions(summary.peakNew, currency)} />
-            <MiniStat label="Cube" value={runId ? shortRunId(runId) : 'PREVIEW'} />
+            <MiniStat label="Exposure Cube ID" value={runId ? shortRunId(runId) : 'PREVIEW'} />
           </div>
         </div>
       </div>
