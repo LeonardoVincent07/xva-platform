@@ -6,6 +6,7 @@ import PortfolioSummary from './components/PortfolioSummary'
 import StatusBar from './components/StatusBar'
 import TradeInputPanel from './components/TradeInputPanel'
 import XvaMetrics from './components/XvaMetrics'
+import SemanticArchitecturePanel from './components/semantic/SemanticArchitecturePanel'
 
 const API_BASE = 'http://127.0.0.1:8000'
 
@@ -209,16 +210,25 @@ export default function App() {
 
         <header className="mt-4 flex items-end justify-between border-b border-white/10 pb-3">
           <div>
-            <h1 className="font-display text-3xl font-semibold tracking-tight text-[#82C7A5]">
-              M7 XVA
-            </h1>
+            <button
+              type="button"
+              onClick={() => setActiveScreen('semantic')}
+              className="group text-left"
+              title="Open semantic architecture model"
+            >
+              <h1 className="font-display text-3xl font-semibold tracking-tight text-[#82C7A5] transition group-hover:text-[#A7E2C3]">
+                M7 XVA
+              </h1>
+            </button>
             <p className="mt-1 text-xs uppercase tracking-[0.24em] text-white/55">
               {
                 activeScreen === 'trader'
                   ? 'New Trade — Incremental XVA'
                   : activeScreen === 'cvaRisk'
                     ? 'CVA Risk — Exposure, Credit and LGD'
-                    : 'Desk Head — Portfolio Actions'
+                    : activeScreen === 'deskHead'
+                      ? 'Desk Head — Portfolio Actions'
+                      : 'Semantic Architecture — Target-State System Map'
               }
             </p>
           </div>
@@ -227,6 +237,7 @@ export default function App() {
             <button type="button" onClick={() => setActiveScreen('trader')} className={`pb-3 ${activeScreen === 'trader' ? 'border-b-2 border-[#0145AC] text-white' : 'text-white/60'}`}>Trader</button>
             <button type="button" onClick={() => setActiveScreen('cvaRisk')} className={`pb-3 ${activeScreen === 'cvaRisk' ? 'border-b-2 border-[#0145AC] text-white' : 'text-white/60'}`}>CVA Risk</button>
             <button type="button" onClick={() => setActiveScreen('deskHead')} className={`pb-3 ${activeScreen === 'deskHead' ? 'border-b-2 border-[#0145AC] text-white' : 'text-white/60'}`}>Desk Head</button>
+            
             <span className="pb-3">Ops / Quant</span>
           </nav>
         </header>
@@ -237,7 +248,9 @@ export default function App() {
           </div>
         )}
 
-        {activeScreen === 'trader' ? (
+        {activeScreen === 'semantic' ? (
+          <SemanticArchitecturePanel />
+        ) : activeScreen === 'trader' ? (
           <main className="mt-5 grid flex-1 grid-cols-1 gap-5 xl:grid-cols-[420px_minmax(0,1fr)]">
           <TradeInputPanel
             form={form}

@@ -2,6 +2,7 @@
   "dependencies": {
     "@tailwindcss/vite": "^4.2.4",
     "axios": "^1.15.2",
+    "reactflow": "^11.11.4",
     "tailwindcss": "^4.2.4"
   }
 }
