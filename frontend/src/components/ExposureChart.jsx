@@ -64,8 +64,9 @@ function SvgChart({ data, newTradeData, currency, summary, showNewTrade, trade }
       <svg viewBox={`0 0 ${width} ${height}`} className="h-[388px] w-full overflow-visible">
         <defs>
           <linearGradient id="xvaDeltaFill" x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stopColor="#82C7A5" stopOpacity="0.24" />
-            <stop offset="100%" stopColor="#82C7A5" stopOpacity="0.02" />
+            <stop offset="0%" stopColor="#82C7A5" stopOpacity="0.34" />
+            <stop offset="55%" stopColor="#82C7A5" stopOpacity="0.14" />
+            <stop offset="100%" stopColor="#82C7A5" stopOpacity="0.04" />
           </linearGradient>
         </defs>
 
@@ -141,7 +142,7 @@ function Legend({ x, y, showNewTrade }) {
       {showNewTrade && (
         <>
           <line x1={x + 142} y1={y} x2={x + 172} y2={y} stroke="#82C7A5" strokeWidth="4" strokeLinecap="round" />
-          <text x={x + 180} y={y + 4}>Post-trade EPE</text>
+          <text x={x + 180} y={y + 4}>EPE (post-trade)</text>
         </>
       )}
       <line x1={showNewTrade ? x + 324 : x + 142} y1={y} x2={showNewTrade ? x + 354 : x + 172} y2={y} stroke="rgba(255,255,255,0.60)" strokeWidth="3" strokeDasharray="6 7" strokeLinecap="round" />
